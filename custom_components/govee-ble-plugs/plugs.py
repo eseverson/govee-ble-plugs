@@ -58,6 +58,9 @@ def get_api_by_model(model: str, device: BLEDevice, token: str) -> GoveePlugApi:
     if model == "H5086":
         return GoveePlugH5086(device, token)
 
+    if model == "H6163":
+        return GoveePlugH6163(device, token)
+
     raise ConfigEntryError(f"Unsupported model {model}")
 
 
@@ -84,6 +87,14 @@ def get_pair_by_model(model: str, device: BLEDevice) -> GoveePairApi:
             GoveePlugH5086.RECV_CHARACTERISTIC_UUID,
             GoveePlugH5086.SEND_CHARACTERISTIC_UUID,
             GoveePlugH5086.MSG_GET_AUTH_KEY,
+        )
+
+    if model == "H6163":
+        return NoOpPlugPairer(
+            device,
+            GoveePlugH6163.RECV_CHARACTERISTIC_UUID,
+            GoveePlugH6163.SEND_CHARACTERISTIC_UUID,
+            GoveePlugH6163.MSG_GET_AUTH_KEY,
         )
 
     raise ConfigEntryError(f"Unsupported model {model}")
@@ -117,6 +128,11 @@ def parse_advertisement_data(
     if local_name.startswith("GVH5086"):
         return GoveeAdvertisementData(
             local_name, device.address, device, GoveePlugH5086.MODEL
+        )
+
+    if local_name.startswith("ihoment_H6163_"):
+        return GoveeAdvertisementData(
+            local_name, device.address, device, GoveePlugH6163.MODEL
         )
 
 
@@ -204,6 +220,99 @@ class GoveePlugH508x:
                 try:
                     await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, msg)
                     await on_set_state_ready.wait()
+                except Exception:
+                    f.set_result(False)
+                    raise
+                else:
+                    f.set_result(True)
+
+            # Process must process entries first
+            while not must_process.empty():
+                msg, f = must_process.get_nowait()
+                await _send_msg(msg, f)
+
+            # Then process anything else that might be in the queue
+            while True:
+                try:
+                    msg, f = await asyncio.wait_for(self._msgqueue.get(), timeout=1)
+                except TimeoutError:
+                    break
+                else:
+                    await _send_msg(msg, f)
+
+            await client.stop_notify(self._RECV_CHARACTERISTIC_UUID)
+
+        except Exception as e:
+            _LOGGER.error("failed to set state: %s", e)
+        finally:
+            # We only force clearing the must process queue. Anything that
+            # was queued while the connection was failing deserves another try
+            # and will be requeued when this task's done callback is called
+            while not must_process.empty():
+                _, f = must_process.get_nowait()
+                f.set_result(False)
+
+            if client is not None:
+                await client.disconnect()
+
+class GoveePlugH6xxx:
+    def __init__(
+        self,
+        device: BLEDevice,
+        token: str,  # Token is ignored for H6xxx series
+        RECV_CHARACTERISTIC_UUID: str,
+        SEND_CHARACTERISTIC_UUID: str,
+    ) -> None:
+        self._device = device
+        self._RECV_CHARACTERISTIC_UUID = RECV_CHARACTERISTIC_UUID
+        self._SEND_CHARACTERISTIC_UUID = SEND_CHARACTERISTIC_UUID
+
+        self._connection_task: T.Optional[asyncio.Task] = None
+        self._msgqueue = asyncio.Queue[T.Tuple[bytes, asyncio.Future[bool]]]()
+
+    async def _send_message(self, msg: bytes) -> bool:
+        f = asyncio.Future[bool]()
+        self._msgqueue.put_nowait((msg, f))
+        self._ensure_message_task()
+        return await f
+
+    def _ensure_message_task(self):
+        if not self._connection_task:
+            self._connection_task = asyncio.create_task(self._message_task_fn())
+            self._connection_task.add_done_callback(self._message_task_done)
+
+    def _message_task_done(self, task: asyncio.Task):
+        try:
+            task.result()
+        except Exception:
+            # if this failed, it was logged or failed while disconnecting
+            pass
+
+        if self._connection_task is task:
+            self._connection_task = None
+
+        if self._connection_task is None and not self._msgqueue.empty():
+            self._ensure_message_task()
+
+    async def _message_task_fn(self):
+        client = None
+        must_process = queue.Queue[T.Tuple[bytes, asyncio.Future]]()
+
+        try:
+            # Pull anything on the message queue directly off, these must
+            # be processed one way or another
+            while not self._msgqueue.empty():
+                must_process.put(self._msgqueue.get_nowait())
+
+            client = await establish_connection(
+                BleakClient,
+                self._device,
+                f"{self._device.name} ({self._device.address})",
+            )
+
+            async def _send_msg(msg: bytes, f: asyncio.Future):
+                try:
+                    await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, msg)
                 except Exception:
                     f.set_result(False)
                     raise
@@ -370,6 +479,42 @@ class GoveePlugH5086(GoveePlugH508x):
             self._is_on = False
 
 
+class GoveePlugH6163(GoveePlugH6xxx):
+    MODEL = "H6163"
+
+    MSG_TURN_ON = _b("3301010000000000000000000000000000000033")
+    MSG_TURN_OFF = _b("3301100000000000000000000000000000000022")
+
+    SEND_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b11"
+    RECV_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b10"
+
+    def __init__(self, device: BLEDevice, token: str) -> None:
+        super().__init__(
+            device, token, self.RECV_CHARACTERISTIC_UUID, self.SEND_CHARACTERISTIC_UUID
+        )
+        self._is_on = None
+
+    def port_names(self) -> T.List[T.Tuple[T.Optional[int], T.Optional[str]]]:
+        return [(None, None)]
+
+    def is_on(self, port: int):
+        return self._is_on
+
+    def handle_bluetooth_event(self, device: BLEDevice, adv: AdvertisementData):
+        for _, mfr_data in adv.manufacturer_data.items():
+            self._device = device
+            self._is_on = mfr_data[-1] == 0x01
+
+    async def async_turn_on(self, port: int):
+        assert port == 0
+        if await self._send_message(self.MSG_TURN_ON):
+            self._is_on = True
+
+    async def async_turn_off(self, port: int):
+        assert port == 0
+        if await self._send_message(self.MSG_TURN_OFF):
+            self._is_on = False
+
 class GoveePlugPairer:
     # At least H5080, H5082, and H5086 all have the same pairing procedure
     # as implemented here
@@ -418,3 +563,22 @@ class GoveePlugPairer:
                     self._result.set_result(auth_key.hex())
             else:
                 await self._send_get_auth_key()
+
+
+class NoOpPlugPairer:
+    # H6163 doesn't seem to need pairing, just return a dummy token
+
+    def __init__(
+        self, device: BLEDevice, recv_uuid: str, send_uuid: str, auth_msg: bytes
+    ) -> None:
+        self._device = device
+        self._recv_uuid = recv_uuid
+        self._send_uuid = send_uuid
+        self._auth_msg = auth_msg
+        self._result = asyncio.Future()
+
+    async def begin(self):
+        pass
+
+    async def finish(self) -> str | None:
+        return "0"
