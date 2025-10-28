@@ -11,7 +11,7 @@ from .coordinator import GoveePlugDataUpdateCoordinator
 
 from .plugs import GoveePlugApi, get_api_by_model
 
-PLATFORMS: list[str] = [Platform.SWITCH]
+PLATFORMS: list[str] = [Platform.SWITCH, Platform.LIGHT]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

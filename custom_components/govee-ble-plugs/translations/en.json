@@ -29,6 +29,11 @@
             "power": {
                 "name": "Power"
             }
+        },
+        "light": {
+            "led": {
+                "name": "LED"
+            }
         }
     }
 }

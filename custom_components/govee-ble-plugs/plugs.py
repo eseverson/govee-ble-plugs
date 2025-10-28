@@ -40,6 +40,12 @@ class GoveePlugApi(T.Protocol):
 
     async def async_turn_off(self, port: int): ...
 
+    # Optional light API methods (only H6163 implements these)
+    def has_light(self) -> bool: ...
+    def get_light_state(self) -> T.Tuple[T.Optional[tuple[int, int, int]], T.Optional[int]]: ...
+    async def async_set_light_rgb(self, rgb: tuple[int, int, int]): ...
+    async def async_set_light_brightness(self, brightness: int): ...
+
 
 class GoveePairApi(T.Protocol):
 
@@ -59,6 +65,8 @@ def get_api_by_model(model: str, device: BLEDevice, token: str) -> GoveePlugApi:
         return GoveePlugH5086(device, token)
 
     if model == "H6163":
+        # Import here to avoid circular dependency
+        from .light import GoveePlugH6163
         return GoveePlugH6163(device, token)
 
     raise ConfigEntryError(f"Unsupported model {model}")
@@ -90,6 +98,8 @@ def get_pair_by_model(model: str, device: BLEDevice) -> GoveePairApi:
         )
 
     if model == "H6163":
+        # Import here to avoid circular dependency
+        from .light import GoveePlugH6163
         return NoOpPlugPairer(
             device,
             GoveePlugH6163.RECV_CHARACTERISTIC_UUID,
@@ -386,6 +396,18 @@ class GoveePlugH5080(GoveePlugH508x):
         if await self._send_message(self.MSG_TURN_OFF):
             self._is_on = False
 
+    def has_light(self) -> bool:
+        return False
+
+    def get_light_state(self) -> T.Tuple[T.Optional[tuple[int, int, int]], T.Optional[int]]:
+        return None, None
+
+    async def async_set_light_rgb(self, rgb: tuple[int, int, int]):
+        pass
+
+    async def async_set_light_brightness(self, brightness: int):
+        pass
+
 
 class GoveePlugH5082(GoveePlugH508x):
     MODEL = "H5082"
@@ -440,6 +462,18 @@ class GoveePlugH5082(GoveePlugH508x):
         if await self._send_message(msg):
             self._is_on[port] = False
 
+    def has_light(self) -> bool:
+        return False
+
+    def get_light_state(self) -> T.Tuple[T.Optional[tuple[int, int, int]], T.Optional[int]]:
+        return None, None
+
+    async def async_set_light_rgb(self, rgb: tuple[int, int, int]):
+        pass
+
+    async def async_set_light_brightness(self, brightness: int):
+        pass
+
 
 class GoveePlugH5086(GoveePlugH508x):
     MODEL = "H5086"
@@ -478,6 +512,18 @@ class GoveePlugH5086(GoveePlugH508x):
         if await self._send_message(self.MSG_TURN_OFF):
             self._is_on = False
 
+    def has_light(self) -> bool:
+        return False
+
+    def get_light_state(self) -> T.Tuple[T.Optional[tuple[int, int, int]], T.Optional[int]]:
+        return None, None
+
+    async def async_set_light_rgb(self, rgb: tuple[int, int, int]):
+        pass
+
+    async def async_set_light_brightness(self, brightness: int):
+        pass
+
 
 class GoveePlugH6163(GoveePlugH6xxx):
     MODEL = "H6163"
@@ -493,9 +539,12 @@ class GoveePlugH6163(GoveePlugH6xxx):
             device, token, self.RECV_CHARACTERISTIC_UUID, self.SEND_CHARACTERISTIC_UUID
         )
         self._is_on = None
+        self._rgb: T.Optional[tuple[int, int, int]] = None
+        self._brightness: T.Optional[int] = None
 
     def port_names(self) -> T.List[T.Tuple[T.Optional[int], T.Optional[str]]]:
-        return [(None, None)]
+        # H6163 is a light device, not a plug - no switch entities
+        return []
 
     def is_on(self, port: int):
         return self._is_on
@@ -514,6 +563,37 @@ class GoveePlugH6163(GoveePlugH6xxx):
         assert port == 0
         if await self._send_message(self.MSG_TURN_OFF):
             self._is_on = False
+
+    def has_light(self) -> bool:
+        return True
+
+    def get_light_state(self) -> T.Tuple[T.Optional[tuple[int, int, int]], T.Optional[int]]:
+        return self._rgb, self._brightness
+
+    async def async_set_light_rgb(self, rgb: tuple[int, int, int]) -> None:
+        """Set RGB color. RGB values should be in range 0-255."""
+        red, green, blue = rgb
+
+        # Create RGB message: [0x33, 0x05, 0x02, RED, GREEN, BLUE, 0x00, 0xFF, 0xAE, 0x54, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        msg = bytearray([0x33, 0x05, 0x02, red, green, blue, 0x00, 0xFF, 0xAE, 0x54,
+                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+
+        # Append XOR checksum
+        msg.append(_sign_payload(msg))
+
+        if await self._send_message(bytes(msg)):
+            self._rgb = rgb
+
+    async def async_set_light_brightness(self, brightness: int) -> None:
+        """Set brightness. Brightness should be in range 0-255."""
+        # Create brightness message: [0x33, 0x04, BRIGHTNESS, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        msg = bytearray([0x33, 0x04, brightness] + [0x00] * 16)
+
+        # Append XOR checksum
+        msg.append(_sign_payload(msg))
+
+        if await self._send_message(bytes(msg)):
+            self._brightness = brightness
 
 class GoveePlugPairer:
     # At least H5080, H5082, and H5086 all have the same pairing procedure
