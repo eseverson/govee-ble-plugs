@@ -142,7 +142,7 @@ class GoveePlugH6163(GoveePlugH6xxx):
     MODEL = "H6163"
 
     MSG_TURN_ON = _b("3301010000000000000000000000000000000033")
-    MSG_TURN_OFF = _b("3301100000000000000000000000000000000022")
+    MSG_TURN_OFF = _b("3301000000000000000000000000000000000032")
 
     SEND_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b11"
     RECV_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b10"
@@ -154,6 +154,7 @@ class GoveePlugH6163(GoveePlugH6xxx):
         self._is_on = None
         self._rgb: T.Optional[tuple[int, int, int]] = None
         self._brightness: T.Optional[int] = None
+        self._effect: T.Optional[str] = "normal"
 
     def port_names(self) -> T.List[T.Tuple[T.Optional[int], T.Optional[str]]]:
         # H6163 is a light device, not a plug - no switch entities
@@ -208,6 +209,36 @@ class GoveePlugH6163(GoveePlugH6xxx):
         if await self._send_message(bytes(msg)):
             self._brightness = brightness
 
+    def get_effect(self) -> T.Optional[str]:
+        return self._effect
+
+    async def async_set_effect(self, effect: str) -> None:
+        """Set effect mode. Returns None if effect is not recognized."""
+        # Effect mappings
+        effects = {
+            "normal": _b("3301010000000000000000000000000000000033"),
+            "music_energetic": _b("3305010000000000000000000000000000000037"),
+            "music_spectrum_red": _b("3305010100ff00000000000000000000000000c9"),
+            "music_spectrum_blue": _b("33050101000000ff0000000000000000000000c9"),
+            "music_rolling_red": _b("33050102ff0000000000000000000000000000ca"),
+            "music_rolling_blue": _b("330501020000ff000000000000000000000000ca"),
+            "music_rhythm": _b("3305010300000000000000000000000000000034"),
+            "scene_sunrise": _b("3305040000000000000000000000000000000032"),
+            "scene_sunset": _b("3305040100000000000000000000000000000033"),
+            "scene_movie": _b("3305040400000000000000000000000000000036"),
+            "scene_dating": _b("3305040500000000000000000000000000000037"),
+            "scene_romantic": _b("3305040700000000000000000000000000000035"),
+            "scene_blinking": _b("330504080000000000000000000000000000003a"),
+            "scene_candlelight": _b("330504090000000000000000000000000000003b"),
+            "scene_snowflake": _b("3305040f0000000000000000000000000000003d"),
+        }
+
+        if effect not in effects:
+            return
+
+        if await self._send_message(effects[effect]):
+            self._effect = effect
+
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
@@ -224,9 +255,26 @@ async def async_setup_entry(
 class GoveePlugLight(GoveePlugEntity, LightEntity):
     """Govee light class."""
 
-    _attr_supported_color_modes = {ColorMode.RGB, ColorMode.BRIGHTNESS}
-    _attr_supported_features = LightEntityFeature(0)
+    _attr_supported_color_modes = {ColorMode.RGB}
+    _attr_supported_features = LightEntityFeature.EFFECT
     _attr_translation_key = "led"
+    _attr_effect_list = [
+        "normal",
+        "music_energetic",
+        "music_spectrum_red",
+        "music_spectrum_blue",
+        # "music_rolling_red",
+        # "music_rolling_blue",
+        "music_rhythm",
+        "scene_sunrise",
+        "scene_sunset",
+        "scene_movie",
+        "scene_dating",
+        "scene_romantic",
+        "scene_blinking",
+        "scene_candlelight",
+        "scene_snowflake",
+    ]
 
     @property
     def color_mode(self) -> ColorMode:
@@ -246,6 +294,11 @@ class GoveePlugLight(GoveePlugEntity, LightEntity):
         return brightness
 
     @property
+    def effect(self) -> str | None:
+        """Return the current effect."""
+        return self.coordinator.api.get_effect()
+
+    @property
     def is_on(self) -> bool | None:
         """Return true if light is on."""
         # Light is considered on if brightness is set
@@ -255,6 +308,12 @@ class GoveePlugLight(GoveePlugEntity, LightEntity):
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on or control the light."""
         rgb, brightness = self.coordinator.api.get_light_state()
+
+        # If an effect is requested, set it and return (effects handle their own brightness/color)
+        if effect := kwargs.get("effect"):
+            await self.coordinator.api.async_set_effect(effect)
+            self.async_write_ha_state()
+            return
 
         # Determine new RGB value
         new_rgb = kwargs.get("rgb_color", rgb)
@@ -279,6 +338,9 @@ class GoveePlugLight(GoveePlugEntity, LightEntity):
         # Update brightness if changed
         if new_brightness != brightness:
             await self.coordinator.api.async_set_light_brightness(new_brightness)
+
+        # Clear effect when setting manual color/brightness
+        await self.coordinator.api.async_set_effect("normal")
 
         self.async_write_ha_state()
 

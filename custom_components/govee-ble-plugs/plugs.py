@@ -45,6 +45,8 @@ class GoveePlugApi(T.Protocol):
     def get_light_state(self) -> T.Tuple[T.Optional[tuple[int, int, int]], T.Optional[int]]: ...
     async def async_set_light_rgb(self, rgb: tuple[int, int, int]): ...
     async def async_set_light_brightness(self, brightness: int): ...
+    def get_effect(self) -> T.Optional[str]: ...
+    async def async_set_effect(self, effect: str): ...
 
 
 class GoveePairApi(T.Protocol):
@@ -141,6 +143,8 @@ def parse_advertisement_data(
         )
 
     if local_name.startswith("ihoment_H6163_"):
+        # Import here to avoid circular dependency
+        from .light import GoveePlugH6163
         return GoveeAdvertisementData(
             local_name, device.address, device, GoveePlugH6163.MODEL
         )
@@ -265,98 +269,7 @@ class GoveePlugH508x:
             if client is not None:
                 await client.disconnect()
 
-class GoveePlugH6xxx:
-    def __init__(
-        self,
-        device: BLEDevice,
-        token: str,  # Token is ignored for H6xxx series
-        RECV_CHARACTERISTIC_UUID: str,
-        SEND_CHARACTERISTIC_UUID: str,
-    ) -> None:
-        self._device = device
-        self._RECV_CHARACTERISTIC_UUID = RECV_CHARACTERISTIC_UUID
-        self._SEND_CHARACTERISTIC_UUID = SEND_CHARACTERISTIC_UUID
-
-        self._connection_task: T.Optional[asyncio.Task] = None
-        self._msgqueue = asyncio.Queue[T.Tuple[bytes, asyncio.Future[bool]]]()
-
-    async def _send_message(self, msg: bytes) -> bool:
-        f = asyncio.Future[bool]()
-        self._msgqueue.put_nowait((msg, f))
-        self._ensure_message_task()
-        return await f
-
-    def _ensure_message_task(self):
-        if not self._connection_task:
-            self._connection_task = asyncio.create_task(self._message_task_fn())
-            self._connection_task.add_done_callback(self._message_task_done)
-
-    def _message_task_done(self, task: asyncio.Task):
-        try:
-            task.result()
-        except Exception:
-            # if this failed, it was logged or failed while disconnecting
-            pass
-
-        if self._connection_task is task:
-            self._connection_task = None
-
-        if self._connection_task is None and not self._msgqueue.empty():
-            self._ensure_message_task()
-
-    async def _message_task_fn(self):
-        client = None
-        must_process = queue.Queue[T.Tuple[bytes, asyncio.Future]]()
-
-        try:
-            # Pull anything on the message queue directly off, these must
-            # be processed one way or another
-            while not self._msgqueue.empty():
-                must_process.put(self._msgqueue.get_nowait())
-
-            client = await establish_connection(
-                BleakClient,
-                self._device,
-                f"{self._device.name} ({self._device.address})",
-            )
-
-            async def _send_msg(msg: bytes, f: asyncio.Future):
-                try:
-                    await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, msg)
-                except Exception:
-                    f.set_result(False)
-                    raise
-                else:
-                    f.set_result(True)
-
-            # Process must process entries first
-            while not must_process.empty():
-                msg, f = must_process.get_nowait()
-                await _send_msg(msg, f)
-
-            # Then process anything else that might be in the queue
-            while True:
-                try:
-                    msg, f = await asyncio.wait_for(self._msgqueue.get(), timeout=1)
-                except TimeoutError:
-                    break
-                else:
-                    await _send_msg(msg, f)
-
-            await client.stop_notify(self._RECV_CHARACTERISTIC_UUID)
-
-        except Exception as e:
-            _LOGGER.error("failed to set state: %s", e)
-        finally:
-            # We only force clearing the must process queue. Anything that
-            # was queued while the connection was failing deserves another try
-            # and will be requeued when this task's done callback is called
-            while not must_process.empty():
-                _, f = must_process.get_nowait()
-                f.set_result(False)
-
-            if client is not None:
-                await client.disconnect()
+# H6163 and H6xxx base class moved to light.py
 
 
 class GoveePlugH5080(GoveePlugH508x):
@@ -406,6 +319,12 @@ class GoveePlugH5080(GoveePlugH508x):
         pass
 
     async def async_set_light_brightness(self, brightness: int):
+        pass
+
+    def get_effect(self) -> T.Optional[str]:
+        return None
+
+    async def async_set_effect(self, effect: str):
         pass
 
 
@@ -474,6 +393,12 @@ class GoveePlugH5082(GoveePlugH508x):
     async def async_set_light_brightness(self, brightness: int):
         pass
 
+    def get_effect(self) -> T.Optional[str]:
+        return None
+
+    async def async_set_effect(self, effect: str):
+        pass
+
 
 class GoveePlugH5086(GoveePlugH508x):
     MODEL = "H5086"
@@ -525,11 +450,7 @@ class GoveePlugH5086(GoveePlugH508x):
         pass
 
 
-class GoveePlugH6163(GoveePlugH6xxx):
-    MODEL = "H6163"
-
-    MSG_TURN_ON = _b("3301010000000000000000000000000000000033")
-    MSG_TURN_OFF = _b("3301100000000000000000000000000000000022")
+class GoveePlugPairer:
 
     SEND_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b11"
     RECV_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b10"
@@ -594,6 +515,7 @@ class GoveePlugH6163(GoveePlugH6xxx):
 
         if await self._send_message(bytes(msg)):
             self._brightness = brightness
+
 
 class GoveePlugPairer:
     # At least H5080, H5082, and H5086 all have the same pairing procedure
