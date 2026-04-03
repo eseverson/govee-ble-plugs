@@ -7,7 +7,7 @@ import typing as T
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
-from bleak_retry_connector import establish_connection
+from bleak_retry_connector import establish_connection, BleakOutOfConnectionSlotsError
 
 from homeassistant.exceptions import ConfigEntryError
 
@@ -39,6 +39,8 @@ class GoveePlugApi(T.Protocol):
     async def async_turn_on(self, port: int): ...
 
     async def async_turn_off(self, port: int): ...
+
+    async def async_query_status(self) -> None: ...
 
     # Optional light API methods (only H6163 implements these)
     def has_light(self) -> bool: ...
@@ -166,6 +168,7 @@ class GoveePlugH508x:
 
         self._connection_task: T.Optional[asyncio.Task] = None
         self._msgqueue = asyncio.Queue[T.Tuple[bytes, asyncio.Future[bool]]]()
+        self._connection_lock = asyncio.Lock()
 
     async def _send_message(self, msg: bytes) -> bool:
         f = asyncio.Future[bool]()
@@ -194,6 +197,7 @@ class GoveePlugH508x:
     async def _message_task_fn(self):
         client = None
         must_process = queue.Queue[T.Tuple[bytes, asyncio.Future]]()
+        device_name = f"{self._device.name} ({self._device.address})"
 
         try:
             # Pull anything on the message queue directly off, these must
@@ -201,11 +205,34 @@ class GoveePlugH508x:
             while not self._msgqueue.empty():
                 must_process.put(self._msgqueue.get_nowait())
 
-            client = await establish_connection(
-                BleakClient,
-                self._device,
-                f"{self._device.name} ({self._device.address})",
-            )
+            # Use connection lock to prevent concurrent connection attempts
+            async with self._connection_lock:
+                try:
+                    client = await establish_connection(
+                        BleakClient,
+                        self._device,
+                        device_name,
+                        max_attempts=2,  # Reduced to 2 to fail faster and free slots
+                        connection_timeout=10.0,  # 10 second timeout per attempt
+                    )
+                except BleakOutOfConnectionSlotsError as e:
+                    _LOGGER.error(
+                        "failed to set state: %s - No available connection slots. "
+                        "Please disconnect unused devices or add more BLE proxies.",
+                        device_name
+                    )
+                    # Mark all pending messages as failed
+                    while not must_process.empty():
+                        _, f = must_process.get_nowait()
+                        f.set_result(False)
+                    return
+                except Exception as e:
+                    _LOGGER.error("failed to connect to %s: %s", device_name, e)
+                    # Mark all pending messages as failed
+                    while not must_process.empty():
+                        _, f = must_process.get_nowait()
+                        f.set_result(False)
+                    return
 
             # events to control execution flow
             on_auth_ready = asyncio.Event()
@@ -257,7 +284,7 @@ class GoveePlugH508x:
             await client.stop_notify(self._RECV_CHARACTERISTIC_UUID)
 
         except Exception as e:
-            _LOGGER.error("failed to set state: %s", e)
+            _LOGGER.error("failed to set state for %s: %s", device_name, e)
         finally:
             # We only force clearing the must process queue. Anything that
             # was queued while the connection was failing deserves another try
@@ -267,7 +294,100 @@ class GoveePlugH508x:
                 f.set_result(False)
 
             if client is not None:
-                await client.disconnect()
+                try:
+                    await client.stop_notify(self._RECV_CHARACTERISTIC_UUID)
+                except Exception:
+                    pass  # Ignore errors when stopping notifications
+                try:
+                    # Ensure we disconnect to free up the connection slot
+                    if client.is_connected:
+                        await client.disconnect()
+                    # Give a small delay to ensure the slot is released
+                    await asyncio.sleep(0.1)
+                except Exception as e:
+                    _LOGGER.debug("Error disconnecting %s: %s", device_name, e)
+
+    async def _query_status_internal(self, query_msg: bytes) -> bool:
+        """Internal method to query device status by connecting and sending a query message."""
+        client = None
+        device_name = f"{self._device.name} ({self._device.address})"
+        status_received = asyncio.Event()
+        status_data = [None]
+
+        try:
+            async with self._connection_lock:
+                try:
+                    client = await establish_connection(
+                        BleakClient,
+                        self._device,
+                        device_name,
+                        max_attempts=1,  # Single attempt for polling
+                        connection_timeout=5.0,  # Shorter timeout for polling
+                    )
+                except (BleakOutOfConnectionSlotsError, Exception) as e:
+                    _LOGGER.debug("failed to connect for status query to %s: %s", device_name, e)
+                    return False
+
+            # Events to control execution flow
+            on_auth_ready = asyncio.Event()
+            on_status_ready = asyncio.Event()
+
+            async def recv_handler(c, data):
+                if data[0] == 0x33 and data[1] == 0xB2:
+                    on_auth_ready.set()
+                elif data[0] == 0x33 and data[1] == 0x01:
+                    # Status response received
+                    status_data[0] = data
+                    on_status_ready.set()
+
+            await client.start_notify(self._RECV_CHARACTERISTIC_UUID, recv_handler)
+
+            # Authenticate
+            ba = bytearray([0x33, 0xB2]) + bytearray.fromhex(self._token).ljust(17, b"\0")
+            ba.append(_sign_payload(ba))
+            await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, ba)
+
+            try:
+                await asyncio.wait_for(on_auth_ready.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                _LOGGER.debug("Authentication timeout for status query to %s", device_name)
+                return False
+
+            # Send query message
+            await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, query_msg)
+
+            try:
+                await asyncio.wait_for(on_status_ready.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                _LOGGER.debug("Status response timeout for %s", device_name)
+                return False
+
+            # Parse status from response if available
+            if status_data[0] and len(status_data[0]) >= 3:
+                self._parse_status_response(status_data[0])
+
+            return True
+
+        except Exception as e:
+            _LOGGER.debug("Error querying status for %s: %s", device_name, e)
+            return False
+        finally:
+            if client is not None:
+                try:
+                    await client.stop_notify(self._RECV_CHARACTERISTIC_UUID)
+                except Exception:
+                    pass
+                try:
+                    if client.is_connected:
+                        await client.disconnect()
+                    await asyncio.sleep(0.1)
+                except Exception as e:
+                    _LOGGER.debug("Error disconnecting %s: %s", device_name, e)
+
+    def _parse_status_response(self, data: bytearray) -> None:
+        """Parse status response. Override in subclasses if needed."""
+        # Default implementation - subclasses can override
+        pass
 
 # H6163 and H6xxx base class moved to light.py
 
@@ -278,6 +398,7 @@ class GoveePlugH5080(GoveePlugH508x):
     MSG_GET_AUTH_KEY = _b("aab100000000000000000000000000000000001b")
     MSG_TURN_ON = _b("3301ff00000000000000000000000000000000cd")
     MSG_TURN_OFF = _b("3301f000000000000000000000000000000000c2")
+    MSG_QUERY_STATUS = _b("3300000000000000000000000000000000000033")
 
     SEND_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b11"
     RECV_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b10"
@@ -295,9 +416,60 @@ class GoveePlugH5080(GoveePlugH508x):
         return self._is_on
 
     def handle_bluetooth_event(self, device: BLEDevice, adv: AdvertisementData):
-        for _, mfr_data in adv.manufacturer_data.items():
-            self._device = device
-            self._is_on = mfr_data[-1] == 0x01
+        # H5080 uses manufacturer ID 34818 (0x8802) for status advertisements
+        # Format: 0xEC 0x00 0x01 0x01 0x00 (off) or 0xEC 0x00 0x01 0x01 0x01 (on)
+        # Last byte indicates state: 0x00 = off, 0x01 = on
+        GOvee_MANUFACTURER_ID = 34818  # 0x8802
+
+        # Log all manufacturer data received
+        if adv.manufacturer_data:
+            for mfr_id, mfr_data in adv.manufacturer_data.items():
+                _LOGGER.debug(
+                    "H5080 %s: Received manufacturer data - mfr_id=%d(0x%04x), data=%s, len=%d",
+                    device.address,
+                    mfr_id,
+                    mfr_id,
+                    mfr_data.hex(),
+                    len(mfr_data)
+                )
+
+        if GOvee_MANUFACTURER_ID in adv.manufacturer_data:
+            mfr_data = adv.manufacturer_data[GOvee_MANUFACTURER_ID]
+            if len(mfr_data) >= 5:  # Ensure we have at least 5 bytes
+                old_state = self._is_on
+                self._device = device
+                # Last byte indicates state: 0x00 = off, 0x01 = on
+                self._is_on = mfr_data[-1] == 0x01
+                if old_state != self._is_on:
+                    _LOGGER.info(
+                        "H5080 %s: State changed from advertisement - is_on=%s (was=%s, mfr_data=%s)",
+                        device.address,
+                        self._is_on,
+                        old_state,
+                        mfr_data.hex()
+                    )
+                else:
+                    _LOGGER.debug(
+                        "H5080 %s: State updated from advertisement - is_on=%s (mfr_data=%s)",
+                        device.address,
+                        self._is_on,
+                        mfr_data.hex()
+                    )
+            else:
+                _LOGGER.debug(
+                    "H5080 %s: Manufacturer data too short - len=%d, expected>=5, data=%s",
+                    device.address,
+                    len(mfr_data),
+                    mfr_data.hex()
+                )
+        else:
+            _LOGGER.debug(
+                "H5080 %s: No matching manufacturer data (looking for %d/0x%04x), received: %s",
+                device.address,
+                GOvee_MANUFACTURER_ID,
+                GOvee_MANUFACTURER_ID,
+                list(adv.manufacturer_data.keys()) if adv.manufacturer_data else "none"
+            )
 
     async def async_turn_on(self, port: int):
         assert port == 0
@@ -327,6 +499,21 @@ class GoveePlugH5080(GoveePlugH508x):
     async def async_set_effect(self, effect: str):
         pass
 
+    async def async_query_status(self) -> None:
+        """Query the current status of the device."""
+        await self._query_status_internal(self.MSG_QUERY_STATUS)
+
+    def _parse_status_response(self, data: bytearray) -> None:
+        """Parse status response from device."""
+        if len(data) >= 3 and data[0] == 0x33 and data[1] == 0x01:
+            # Status is in the third byte or last byte
+            if len(data) >= 20:
+                # Check last byte for status (similar to advertisement parsing)
+                self._is_on = data[-1] == 0x01
+            elif len(data) >= 3:
+                # Try third byte
+                self._is_on = (data[2] & 0xFF) == 0xFF
+
 
 class GoveePlugH5082(GoveePlugH508x):
     MODEL = "H5082"
@@ -337,6 +524,7 @@ class GoveePlugH5082(GoveePlugH508x):
     MSG_LEFT_OFF = _b("3301200000000000000000000000000000000012")
     MSG_RIGHT_ON = _b("3301110000000000000000000000000000000023")
     MSG_RIGHT_OFF = _b("3301100000000000000000000000000000000022")
+    MSG_QUERY_STATUS = _b("3300000000000000000000000000000000000033")
 
     SEND_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b11"
     RECV_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b10"
@@ -354,10 +542,40 @@ class GoveePlugH5082(GoveePlugH508x):
         return self._is_on[port]
 
     def handle_bluetooth_event(self, device: BLEDevice, adv: AdvertisementData):
-        for _, mfr_data in adv.manufacturer_data.items():
+        old_state = self._is_on.copy() if self._is_on[0] is not None and self._is_on[1] is not None else [None, None]
+        for mfr_id, mfr_data in adv.manufacturer_data.items():
+            _LOGGER.debug(
+                "H5082 %s: Received manufacturer data - mfr_id=%d(0x%04x), data=%s, len=%d",
+                device.address,
+                mfr_id,
+                mfr_id,
+                mfr_data.hex(),
+                len(mfr_data)
+            )
             self._device = device
-            self._is_on[0] = (mfr_data[-1] & 0x2) == 0x2
-            self._is_on[1] = (mfr_data[-1] & 0x1) == 0x1
+            if len(mfr_data) > 0:
+                new_left = (mfr_data[-1] & 0x2) == 0x2
+                new_right = (mfr_data[-1] & 0x1) == 0x1
+                self._is_on[0] = new_left
+                self._is_on[1] = new_right
+                if old_state[0] != new_left or old_state[1] != new_right:
+                    _LOGGER.info(
+                        "H5082 %s: State changed from advertisement - left=%s, right=%s (was left=%s, right=%s, mfr_data=%s)",
+                        device.address,
+                        new_left,
+                        new_right,
+                        old_state[0],
+                        old_state[1],
+                        mfr_data.hex()
+                    )
+                else:
+                    _LOGGER.debug(
+                        "H5082 %s: State updated from advertisement - left=%s, right=%s (mfr_data=%s)",
+                        device.address,
+                        new_left,
+                        new_right,
+                        mfr_data.hex()
+                    )
 
     async def async_turn_on(self, port: int):
         if port == 0:
@@ -399,6 +617,19 @@ class GoveePlugH5082(GoveePlugH508x):
     async def async_set_effect(self, effect: str):
         pass
 
+    async def async_query_status(self) -> None:
+        """Query the current status of the device."""
+        await self._query_status_internal(self.MSG_QUERY_STATUS)
+
+    def _parse_status_response(self, data: bytearray) -> None:
+        """Parse status response from device."""
+        if len(data) >= 3 and data[0] == 0x33 and data[1] == 0x01:
+            # Status is in the last byte (similar to advertisement parsing)
+            if len(data) >= 20:
+                status_byte = data[-1]
+                self._is_on[0] = (status_byte & 0x2) == 0x2
+                self._is_on[1] = (status_byte & 0x1) == 0x1
+
 
 class GoveePlugH5086(GoveePlugH508x):
     MODEL = "H5086"
@@ -406,6 +637,7 @@ class GoveePlugH5086(GoveePlugH508x):
     MSG_GET_AUTH_KEY = _b("aab100000000000000000000000000000000001b")
     MSG_TURN_ON = _b("3301010000000000000000000000000000000033")
     MSG_TURN_OFF = _b("3301000000000000000000000000000000000032")
+    MSG_QUERY_STATUS = _b("3300000000000000000000000000000000000033")
 
     SEND_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b11"
     RECV_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b10"
@@ -423,9 +655,35 @@ class GoveePlugH5086(GoveePlugH508x):
         return self._is_on
 
     def handle_bluetooth_event(self, device: BLEDevice, adv: AdvertisementData):
-        for _, mfr_data in adv.manufacturer_data.items():
+        old_state = self._is_on
+        for mfr_id, mfr_data in adv.manufacturer_data.items():
+            _LOGGER.debug(
+                "H5086 %s: Received manufacturer data - mfr_id=%d(0x%04x), data=%s, len=%d",
+                device.address,
+                mfr_id,
+                mfr_id,
+                mfr_data.hex(),
+                len(mfr_data)
+            )
             self._device = device
-            self._is_on = mfr_data[-1] == 0x01
+            if len(mfr_data) > 0:
+                new_state = mfr_data[-1] == 0x01
+                self._is_on = new_state
+                if old_state != new_state:
+                    _LOGGER.info(
+                        "H5086 %s: State changed from advertisement - is_on=%s (was=%s, mfr_data=%s)",
+                        device.address,
+                        new_state,
+                        old_state,
+                        mfr_data.hex()
+                    )
+                else:
+                    _LOGGER.debug(
+                        "H5086 %s: State updated from advertisement - is_on=%s (mfr_data=%s)",
+                        device.address,
+                        new_state,
+                        mfr_data.hex()
+                    )
 
     async def async_turn_on(self, port: int):
         assert port == 0
@@ -448,6 +706,17 @@ class GoveePlugH5086(GoveePlugH508x):
 
     async def async_set_light_brightness(self, brightness: int):
         pass
+
+    async def async_query_status(self) -> None:
+        """Query the current status of the device."""
+        await self._query_status_internal(self.MSG_QUERY_STATUS)
+
+    def _parse_status_response(self, data: bytearray) -> None:
+        """Parse status response from device."""
+        if len(data) >= 3 and data[0] == 0x33 and data[1] == 0x01:
+            # Status is in the last byte (similar to advertisement parsing)
+            if len(data) >= 20:
+                self._is_on = data[-1] == 0x01
 
 
 class GoveePlugPairer:
@@ -531,21 +800,41 @@ class GoveePlugPairer:
         self._result = asyncio.Future()
 
     async def begin(self):
-        _LOGGER.info(f"%s: connecting to begin pairing", self._device.name)
-        self._client = await establish_connection(
-            BleakClient,
-            self._device,
-            f"{self._device.name} ({self._device.address})",
-        )
+        device_name = f"{self._device.name} ({self._device.address})"
+        _LOGGER.info("%s: connecting to begin pairing", device_name)
+        try:
+            self._client = await establish_connection(
+                BleakClient,
+                self._device,
+                device_name,
+                max_attempts=3,
+            )
+        except BleakOutOfConnectionSlotsError as e:
+            _LOGGER.error(
+                "failed to connect for pairing: %s - No available connection slots. "
+                "Please disconnect unused devices or add more BLE proxies.",
+                device_name
+            )
+            raise
+        except Exception as e:
+            _LOGGER.error("failed to connect for pairing: %s: %s", device_name, e)
+            raise
 
         await self._client.start_notify(self._recv_uuid, self._recv_handler)
         await self._send_get_auth_key()
 
     async def finish(self) -> str | None:
         token = await self._result
-        _LOGGER.info(f"%s: finishing pairing", self._device.name)
-        await self._client.stop_notify(self._recv_uuid)
-        await self._client.disconnect()
+        device_name = f"{self._device.name} ({self._device.address})"
+        _LOGGER.info("%s: finishing pairing", device_name)
+        try:
+            await self._client.stop_notify(self._recv_uuid)
+        except Exception:
+            pass  # Ignore errors when stopping notifications
+        try:
+            await self._client.disconnect()
+        except Exception as e:
+            _LOGGER.debug("Error disconnecting %s: %s", device_name, e)
         return token
 
     async def _send_get_auth_key(self):

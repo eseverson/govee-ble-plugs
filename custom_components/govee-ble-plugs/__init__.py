@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import logging
+
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ACCESS_TOKEN, CONF_ADDRESS, CONF_MODEL, Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
 
-from .const import DOMAIN
+_LOGGER = logging.getLogger(__name__)
+
+from .const import DOMAIN, CONF_ENABLE_POLLING, DEFAULT_ENABLE_POLLING
 from .coordinator import GoveePlugDataUpdateCoordinator
 
 from .plugs import GoveePlugApi, get_api_by_model
@@ -19,17 +22,42 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     model: str = entry.data[CONF_MODEL]
     token: str = entry.data[CONF_ACCESS_TOKEN]
     bdaddr: str = entry.data[CONF_ADDRESS]
+    
+    # Try to find the device, but don't fail if not found yet
+    # The coordinator will continue listening for the device via Bluetooth advertisements
     ble_device = bluetooth.async_ble_device_from_address(hass, bdaddr, connectable=True)
     if not ble_device:
-        raise ConfigEntryNotReady(f"Could not find Govee {model} with address {bdaddr}")
-
-    api: GoveePlugApi = get_api_by_model(model, ble_device, token)
-
-    coordinator = GoveePlugDataUpdateCoordinator(hass, api=api, ble_device=ble_device)
-
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+        _LOGGER.info(
+            "Device not found for Govee %s with address %s. "
+            "Will continue listening for device to appear.",
+            model,
+            bdaddr
+        )
+    
+    # Store address and model for coordinator to use when creating API
+    hass.data[DOMAIN][entry.entry_id] = {
+        "model": model,
+        "token": token,
+        "address": bdaddr,
+        "ble_device": ble_device,
+    }
+    
+    if ble_device:
+        api: GoveePlugApi = get_api_by_model(model, ble_device, token)
+        coordinator = GoveePlugDataUpdateCoordinator(
+            hass, api=api, ble_device=ble_device, address=bdaddr, enable_polling=entry.options.get(CONF_ENABLE_POLLING, DEFAULT_ENABLE_POLLING)
+        )
+        hass.data[DOMAIN][entry.entry_id]["coordinator"] = coordinator
+    else:
+        # Create coordinator without initial device - will be set when device is discovered
+        coordinator = GoveePlugDataUpdateCoordinator(
+            hass, api=None, ble_device=None, address=bdaddr, model=model, token=token, enable_polling=entry.options.get(CONF_ENABLE_POLLING, DEFAULT_ENABLE_POLLING)
+        )
+        hass.data[DOMAIN][entry.entry_id]["coordinator"] = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    # Register coordinator start (returns cleanup function)
+    # This starts passive Bluetooth listening and polling if enabled
     entry.async_on_unload(coordinator.async_start())
 
     return True
@@ -38,6 +66,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Handle removal of an entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        hass.data[DOMAIN].pop(entry.entry_id)
+        entry_data = hass.data[DOMAIN].pop(entry.entry_id)
+        coordinator = entry_data.get("coordinator")
+        if coordinator:
+            await coordinator.async_shutdown()
 
     return unload_ok

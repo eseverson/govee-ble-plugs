@@ -10,10 +10,11 @@ from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_discovered_service_info,
 )
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow, OptionsFlowWithReload
 from homeassistant.const import CONF_ACCESS_TOKEN, CONF_ADDRESS, CONF_MODEL
+from homeassistant.core import callback
 
-from .const import DOMAIN
+from .const import DOMAIN, CONF_ENABLE_POLLING, DEFAULT_ENABLE_POLLING
 from .plugs import (
     parse_advertisement_data,
     GoveeAdvertisementData,
@@ -137,4 +138,35 @@ class GoveeBlePlugsConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_ACCESS_TOKEN: token,
                 CONF_MODEL: model,
             },
+            options={CONF_ENABLE_POLLING: DEFAULT_ENABLE_POLLING},
+        )
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry) -> OptionsFlow:
+        """Create the options flow."""
+        return GoveeBlePlugsOptionsFlowHandler()
+
+
+class GoveeBlePlugsOptionsFlowHandler(OptionsFlowWithReload):
+    """Handle options flow for Govee BLE Plugs."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the options."""
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+
+        options_schema = vol.Schema(
+            {
+                vol.Required(CONF_ENABLE_POLLING): bool,
+            }
+        )
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=self.add_suggested_values_to_schema(
+                options_schema, self.config_entry.options
+            ),
         )

@@ -12,6 +12,12 @@
             "link": {
                 "title": "Pair Govee Smart Plug",
                 "description": "Press the button on the outlet to register with Home Assistant."
+            },
+            "init": {
+                "data": {
+                    "enable_polling": "Enable status polling"
+                },
+                "description": "Configure polling options. Status updates from BLE advertisements will always work regardless of this setting."
             }
         },
         "error": {
