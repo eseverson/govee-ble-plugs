@@ -22,7 +22,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     model: str = entry.data[CONF_MODEL]
     token: str = entry.data[CONF_ACCESS_TOKEN]
     bdaddr: str = entry.data[CONF_ADDRESS]
-    
+
     # Try to find the device, but don't fail if not found yet
     # The coordinator will continue listening for the device via Bluetooth advertisements
     ble_device = bluetooth.async_ble_device_from_address(hass, bdaddr, connectable=True)
@@ -33,7 +33,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             model,
             bdaddr
         )
-    
+
     # Store address and model for coordinator to use when creating API
     hass.data[DOMAIN][entry.entry_id] = {
         "model": model,
@@ -41,7 +41,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "address": bdaddr,
         "ble_device": ble_device,
     }
-    
+
     if ble_device:
         api: GoveePlugApi = get_api_by_model(model, ble_device, token)
         coordinator = GoveePlugDataUpdateCoordinator(

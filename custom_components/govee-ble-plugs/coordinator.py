@@ -52,12 +52,12 @@ class GoveePlugDataUpdateCoordinator(PassiveBluetoothDataUpdateCoordinator):
         self._current_backoff = POLLING_INTERVAL
         self._status_query_supported = True  # Assume supported until proven otherwise
         self._status_query_failures = 0
-        
+
         # Store parameters for deferred API creation
         self._address = address or (ble_device.address if ble_device else None)
         self._model = model
         self._token = token
-        
+
         super().__init__(
             hass,
             _LOGGER,
@@ -266,7 +266,7 @@ class GoveePlugDataUpdateCoordinator(PassiveBluetoothDataUpdateCoordinator):
     @callback
     def async_start(self) -> CALLBACK_TYPE:
         """Start coordinator and polling task.
-        
+
         Returns a cleanup function that should be registered with entry.async_on_unload().
         This follows the Home Assistant pattern where async_start() is a callback (not async)
         that registers Bluetooth callbacks and returns a cleanup function.
@@ -274,19 +274,19 @@ class GoveePlugDataUpdateCoordinator(PassiveBluetoothDataUpdateCoordinator):
         # Call parent's async_start() to register for Bluetooth advertisements
         # This returns a cleanup function that we'll chain with our own cleanup
         parent_cleanup = super().async_start()
-        
+
         _LOGGER.debug(
             "Starting coordinator for %s (%s) - polling enabled: %s",
             self._address,
             self.api.MODEL if self.api else self._model,
             self._enable_polling
         )
-        
+
         # Start polling task only if polling is enabled
         if self._enable_polling and self._polling_task is None:
             self._polling_task = asyncio.create_task(self._async_poll_device_status())
             _LOGGER.debug("Started polling task for %s", self._address)
-        
+
         # Return a cleanup function that stops both parent and our polling
         @callback
         def _cleanup() -> None:
@@ -297,7 +297,7 @@ class GoveePlugDataUpdateCoordinator(PassiveBluetoothDataUpdateCoordinator):
             if self._polling_task:
                 self._polling_task.cancel()
                 self._polling_task = None
-        
+
         return _cleanup
 
     async def async_shutdown(self) -> None:

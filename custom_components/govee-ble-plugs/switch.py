@@ -25,7 +25,7 @@ async def async_setup_entry(
         port_names = coordinator.api.port_names()
     else:
         port_names = [(None, None)]
-    
+
     for port, port_name in port_names:
         entities.append(GoveePlugSwitch(coordinator, entry, port, port_name))
     async_add_entities(entities)

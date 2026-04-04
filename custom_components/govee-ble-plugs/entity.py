@@ -48,7 +48,7 @@ class GoveePlugEntity(
     @property
     def available(self) -> bool:
         """Return if entity is available.
-        
+
         Entity is available only if:
         1. The coordinator has API initialized (device was discovered)
         2. The coordinator has valid state data
@@ -56,7 +56,7 @@ class GoveePlugEntity(
         # If API not initialized yet, entity is unavailable
         if not self.coordinator.api:
             return False
-        
+
         # For devices with state data, check if we have data
         # is_on() returns None when no state data is available
         state = self.coordinator.api.is_on(self._port)

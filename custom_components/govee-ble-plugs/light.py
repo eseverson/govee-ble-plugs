@@ -189,6 +189,7 @@ class GoveePlugH6163(GoveePlugH6xxx):
         self._is_on = None
         self._rgb: T.Optional[tuple[int, int, int]] = None
         self._brightness: T.Optional[int] = None
+        self._last_brightness: int = 255  # Track last non-zero brightness for restore
         self._effect: T.Optional[str] = "normal"
 
     def port_names(self) -> T.List[T.Tuple[T.Optional[int], T.Optional[str]]]:
@@ -200,6 +201,31 @@ class GoveePlugH6163(GoveePlugH6xxx):
 
     def handle_bluetooth_event(self, device: BLEDevice, adv: AdvertisementData):
         old_state = self._is_on
+        
+        _LOGGER.debug(
+            "H6163 handle_bluetooth_event called for %s, manufacturer_data present: %s",
+            device.address,
+            adv.manufacturer_data is not None and len(adv.manufacturer_data) > 0
+        )
+        
+        # Ensure device is initialized with default brightness on first discovery
+        # This makes entity available even without manufacturer data
+        if self._brightness is None:
+            self._brightness = 255
+            _LOGGER.debug(
+                "H6163 %s: Device discovered, initializing brightness to %d (no state data yet)",
+                device.address,
+                self._brightness
+            )
+        
+        if not adv.manufacturer_data:
+            _LOGGER.debug(
+                "H6163 %s: No manufacturer_data in advertisement (mfr_data=%s)",
+                device.address,
+                adv.manufacturer_data
+            )
+            return
+        
         for mfr_id, mfr_data in adv.manufacturer_data.items():
             _LOGGER.debug(
                 "H6163 %s: Received manufacturer data - mfr_id=%d(0x%04x), data=%s, len=%d",
@@ -213,6 +239,16 @@ class GoveePlugH6163(GoveePlugH6xxx):
             if len(mfr_data) > 0:
                 new_state = mfr_data[-1] == 0x01
                 self._is_on = new_state
+                
+                # Update brightness based on manufacturer data state
+                if new_state is False and old_state is True:
+                    # Device turned off - sync brightness to 0
+                    self._brightness = 0
+                    _LOGGER.debug(
+                        "H6163 %s: Synced brightness to 0 (device turned off)",
+                        device.address
+                    )
+
                 if old_state != new_state:
                     _LOGGER.info(
                         "H6163 %s: State changed from advertisement - is_on=%s (was=%s, mfr_data=%s)",
@@ -243,6 +279,11 @@ class GoveePlugH6163(GoveePlugH6xxx):
         return True
 
     def get_light_state(self) -> T.Tuple[T.Optional[tuple[int, int, int]], T.Optional[int]]:
+        _LOGGER.debug(
+            "H6163 get_light_state: rgb=%s, brightness=%s",
+            self._rgb,
+            self._brightness
+        )
         return self._rgb, self._brightness
 
     async def async_set_light_rgb(self, rgb: tuple[int, int, int]) -> None:
@@ -269,6 +310,9 @@ class GoveePlugH6163(GoveePlugH6xxx):
 
         if await self._send_message(bytes(msg)):
             self._brightness = brightness
+            # Remember last non-zero brightness for restore when turning back on
+            if brightness > 0:
+                self._last_brightness = brightness
 
     def get_effect(self) -> T.Optional[str]:
         return self._effect
@@ -407,15 +451,22 @@ class GoveePlugLight(GoveePlugEntity, LightEntity):
     @property
     def available(self) -> bool:
         """Return if entity is available.
-        
+
         Light is available when API is initialized and we have valid state data.
         """
         if not self.coordinator.api:
+            _LOGGER.debug("GoveePlugLight.available: API not initialized, returning False")
             return False
-        
+
         # Light is available if we have brightness data
         _, brightness = self.coordinator.api.get_light_state()
-        return brightness is not None
+        is_available = brightness is not None
+        _LOGGER.debug(
+            "GoveePlugLight.available: brightness=%s, is_available=%s",
+            brightness,
+            is_available
+        )
+        return is_available
 
     @property
     def rgb_color(self) -> tuple[int, int, int] | None:
@@ -453,7 +504,7 @@ class GoveePlugLight(GoveePlugEntity, LightEntity):
         """Turn on or control the light."""
         if not self.coordinator.api:
             return
-        
+
         rgb, brightness = self.coordinator.api.get_light_state()
 
         # If an effect is requested, set it and return (effects handle their own brightness/color)
@@ -469,9 +520,11 @@ class GoveePlugLight(GoveePlugEntity, LightEntity):
             new_rgb = (255, 255, 255)
 
         # Determine new brightness
-        new_brightness = kwargs.get("brightness", brightness)
+        # If brightness is not specified, use last known good brightness (or 255 if none)
+        new_brightness = kwargs.get("brightness")
         if new_brightness is None:
-            new_brightness = 255
+            # Use the last non-zero brightness if available, otherwise default to 255
+            new_brightness = self.coordinator.api._last_brightness if hasattr(self.coordinator.api, '_last_brightness') else 255
 
         # If brightness is 0, turn off instead
         if new_brightness == 0:
@@ -495,6 +548,9 @@ class GoveePlugLight(GoveePlugEntity, LightEntity):
         """Turn off the light."""
         if not self.coordinator.api:
             return
-        
-        await self.coordinator.api.async_set_light_brightness(0)
+
+        # Use the proper turn off command instead of setting brightness to 0
+        await self.coordinator.api.async_turn_off(0)
+        # Update brightness state to reflect off
+        self.coordinator.api._brightness = 0
         self.async_write_ha_state()
