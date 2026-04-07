@@ -719,71 +719,71 @@ class GoveePlugH5086(GoveePlugH508x):
                 self._is_on = data[-1] == 0x01
 
 
-class GoveePlugPairer:
+# class GoveePlugPairer:
 
-    SEND_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b11"
-    RECV_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b10"
+#     SEND_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b11"
+#     RECV_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b10"
 
-    def __init__(self, device: BLEDevice, token: str) -> None:
-        super().__init__(
-            device, token, self.RECV_CHARACTERISTIC_UUID, self.SEND_CHARACTERISTIC_UUID
-        )
-        self._is_on = None
-        self._rgb: T.Optional[tuple[int, int, int]] = None
-        self._brightness: T.Optional[int] = None
+#     def __init__(self, device: BLEDevice, token: str) -> None:
+#         super().__init__(
+#             device, token, self.RECV_CHARACTERISTIC_UUID, self.SEND_CHARACTERISTIC_UUID
+#         )
+#         self._is_on = None
+#         self._rgb: T.Optional[tuple[int, int, int]] = None
+#         self._brightness: T.Optional[int] = None
 
-    def port_names(self) -> T.List[T.Tuple[T.Optional[int], T.Optional[str]]]:
-        # H6163 is a light device, not a plug - no switch entities
-        return []
+#     def port_names(self) -> T.List[T.Tuple[T.Optional[int], T.Optional[str]]]:
+#         # H6163 is a light device, not a plug - no switch entities
+#         return []
 
-    def is_on(self, port: int):
-        return self._is_on
+#     def is_on(self, port: int):
+#         return self._is_on
 
-    def handle_bluetooth_event(self, device: BLEDevice, adv: AdvertisementData):
-        for _, mfr_data in adv.manufacturer_data.items():
-            self._device = device
-            self._is_on = mfr_data[-1] == 0x01
+#     def handle_bluetooth_event(self, device: BLEDevice, adv: AdvertisementData):
+#         for _, mfr_data in adv.manufacturer_data.items():
+#             self._device = device
+#             self._is_on = mfr_data[-1] == 0x01
 
-    async def async_turn_on(self, port: int):
-        assert port == 0
-        if await self._send_message(self.MSG_TURN_ON):
-            self._is_on = True
+#     async def async_turn_on(self, port: int):
+#         assert port == 0
+#         if await self._send_message(self.MSG_TURN_ON):
+#             self._is_on = True
 
-    async def async_turn_off(self, port: int):
-        assert port == 0
-        if await self._send_message(self.MSG_TURN_OFF):
-            self._is_on = False
+#     async def async_turn_off(self, port: int):
+#         assert port == 0
+#         if await self._send_message(self.MSG_TURN_OFF):
+#             self._is_on = False
 
-    def has_light(self) -> bool:
-        return True
+#     def has_light(self) -> bool:
+#         return True
 
-    def get_light_state(self) -> T.Tuple[T.Optional[tuple[int, int, int]], T.Optional[int]]:
-        return self._rgb, self._brightness
+#     def get_light_state(self) -> T.Tuple[T.Optional[tuple[int, int, int]], T.Optional[int]]:
+#         return self._rgb, self._brightness
 
-    async def async_set_light_rgb(self, rgb: tuple[int, int, int]) -> None:
-        """Set RGB color. RGB values should be in range 0-255."""
-        red, green, blue = rgb
+#     async def async_set_light_rgb(self, rgb: tuple[int, int, int]) -> None:
+#         """Set RGB color. RGB values should be in range 0-255."""
+#         red, green, blue = rgb
 
-        # Create RGB message: [0x33, 0x05, 0x02, RED, GREEN, BLUE, 0x00, 0xFF, 0xAE, 0x54, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
-        msg = bytearray([0x33, 0x05, 0x02, red, green, blue, 0x00, 0xFF, 0xAE, 0x54,
-                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+#         # Create RGB message: [0x33, 0x05, 0x02, RED, GREEN, BLUE, 0x00, 0xFF, 0xAE, 0x54, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+#         msg = bytearray([0x33, 0x05, 0x02, red, green, blue, 0x00, 0xFF, 0xAE, 0x54,
+#                          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
 
-        # Append XOR checksum
-        msg.append(_sign_payload(msg))
+#         # Append XOR checksum
+#         msg.append(_sign_payload(msg))
 
-        if await self._send_message(bytes(msg)):
-            self._rgb = rgb
+#         if await self._send_message(bytes(msg)):
+#             self._rgb = rgb
 
-    async def async_set_light_brightness(self, brightness: int) -> None:
-        """Set brightness. Brightness should be in range 0-255."""
-        # Create brightness message: [0x33, 0x04, BRIGHTNESS, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
-        msg = bytearray([0x33, 0x04, brightness] + [0x00] * 16)
+#     async def async_set_light_brightness(self, brightness: int) -> None:
+#         """Set brightness. Brightness should be in range 0-255."""
+#         # Create brightness message: [0x33, 0x04, BRIGHTNESS, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+#         msg = bytearray([0x33, 0x04, brightness] + [0x00] * 16)
 
-        # Append XOR checksum
-        msg.append(_sign_payload(msg))
+#         # Append XOR checksum
+#         msg.append(_sign_payload(msg))
 
-        if await self._send_message(bytes(msg)):
-            self._brightness = brightness
+#         if await self._send_message(bytes(msg)):
+#             self._brightness = brightness
 
 
 class GoveePlugPairer:

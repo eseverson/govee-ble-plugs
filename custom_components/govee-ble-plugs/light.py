@@ -179,6 +179,10 @@ class GoveePlugH6163(GoveePlugH6xxx):
     MSG_TURN_OFF = _b("3301000000000000000000000000000000000032")
     MSG_QUERY_STATUS = _b("3300000000000000000000000000000000000033")
 
+    MSG_KEEP_ALIVE = _b("aa010000000000000000000000000000000000ab")
+    MSG_GET_BRIGHTNESS = _b("aa040000000000000000000000000000000000ae")
+    MSG_GET_COLOR = _b("aa050100000000000000000000000000000000ae")
+
     SEND_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b11"
     RECV_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b10"
 
@@ -201,13 +205,13 @@ class GoveePlugH6163(GoveePlugH6xxx):
 
     def handle_bluetooth_event(self, device: BLEDevice, adv: AdvertisementData):
         old_state = self._is_on
-        
+
         _LOGGER.debug(
             "H6163 handle_bluetooth_event called for %s, manufacturer_data present: %s",
             device.address,
             adv.manufacturer_data is not None and len(adv.manufacturer_data) > 0
         )
-        
+
         # Ensure device is initialized with default brightness on first discovery
         # This makes entity available even without manufacturer data
         if self._brightness is None:
@@ -217,7 +221,7 @@ class GoveePlugH6163(GoveePlugH6xxx):
                 device.address,
                 self._brightness
             )
-        
+
         if not adv.manufacturer_data:
             _LOGGER.debug(
                 "H6163 %s: No manufacturer_data in advertisement (mfr_data=%s)",
@@ -225,7 +229,7 @@ class GoveePlugH6163(GoveePlugH6xxx):
                 adv.manufacturer_data
             )
             return
-        
+
         for mfr_id, mfr_data in adv.manufacturer_data.items():
             _LOGGER.debug(
                 "H6163 %s: Received manufacturer data - mfr_id=%d(0x%04x), data=%s, len=%d",
@@ -239,7 +243,7 @@ class GoveePlugH6163(GoveePlugH6xxx):
             if len(mfr_data) > 0:
                 new_state = mfr_data[-1] == 0x01
                 self._is_on = new_state
-                
+
                 # Update brightness based on manufacturer data state
                 if new_state is False and old_state is True:
                     # Device turned off - sync brightness to 0
@@ -279,11 +283,11 @@ class GoveePlugH6163(GoveePlugH6xxx):
         return True
 
     def get_light_state(self) -> T.Tuple[T.Optional[tuple[int, int, int]], T.Optional[int]]:
-        _LOGGER.debug(
-            "H6163 get_light_state: rgb=%s, brightness=%s",
-            self._rgb,
-            self._brightness
-        )
+        # _LOGGER.debug(
+        #     "H6163 get_light_state: rgb=%s, brightness=%s",
+        #     self._rgb,
+        #     self._brightness
+        # )
         return self._rgb, self._brightness
 
     async def async_set_light_rgb(self, rgb: tuple[int, int, int]) -> None:
@@ -291,8 +295,8 @@ class GoveePlugH6163(GoveePlugH6xxx):
         red, green, blue = rgb
 
         # Create RGB message: [0x33, 0x05, 0x02, RED, GREEN, BLUE, 0x00, 0xFF, 0xAE, 0x54, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
-        msg = bytearray([0x33, 0x05, 0x02, red, green, blue, 0x00, 0xFF, 0xAE, 0x54,
-                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        msg = bytearray([0x33, 0x05, 0x02, red, green, blue, 0x00, 0xFF, 0xAE, 0x54]
+                         + [0x00] * 9)
 
         # Append XOR checksum
         msg.append(_sign_payload(msg))
@@ -348,7 +352,7 @@ class GoveePlugH6163(GoveePlugH6xxx):
         """Query the current status of the device."""
         client = None
         device_name = f"{self._device.name} ({self._device.address})"
-        status_data = [None]
+        # status_data = [None]
 
         try:
             async with self._connection_lock:
@@ -367,26 +371,44 @@ class GoveePlugH6163(GoveePlugH6xxx):
             on_status_ready = asyncio.Event()
 
             async def recv_handler(c, data):
-                if data[0] == 0x33 and data[1] == 0x01:
+                _LOGGER.debug("Received data in status query from %s: %s", device_name, data.hex())
+                if data[0] == 0xaa and data[1] == 0x04:
+                    # Brightness response received (aa04[brightness]...)
+                    self._brightness = data[2]
+                    _LOGGER.debug("Brightness response: %d", self._brightness)
+                    on_status_ready.set()
+                elif data[0] == 0xaa and data[1] == 0x05:
+                    # Color response received (aa05[xx][R][G][B]...)
+                    self._rgb = (data[3], data[4], data[5])
+                    _LOGGER.debug("Color response: rgb=%s, data[2]=%d", self._rgb, data[2])
+                    on_status_ready.set()
+                elif data[0] == 0x33 and data[1] == 0x01:
                     # Status response received
-                    status_data[0] = data
+                    # status_data[0] = data
                     on_status_ready.set()
 
+            _LOGGER.debug("listening to uuid %s for status response from %s", self._RECV_CHARACTERISTIC_UUID, device_name)
             await client.start_notify(self._RECV_CHARACTERISTIC_UUID, recv_handler)
 
             # H6163 doesn't require authentication, send query directly
-            await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, self.MSG_QUERY_STATUS)
+            # await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, self.MSG_QUERY_STATUS)
+            await client.write_gatt_char(0x15, self.MSG_GET_BRIGHTNESS, response=False)
 
             try:
-                await asyncio.wait_for(on_status_ready.wait(), timeout=3.0)
+                await asyncio.wait_for(on_status_ready.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 _LOGGER.debug("Status response timeout for %s", device_name)
                 return
 
-            # Parse status from response if available
-            if status_data[0] and len(status_data[0]) >= 3:
-                if len(status_data[0]) >= 20:
-                    self._is_on = status_data[0][-1] == 0x01
+            _LOGGER.debug("Brightness query successful, now querying color for %s", device_name)
+            # await client.start_notify(self._RECV_CHARACTERISTIC_UUID, recv_handler)
+            await client.write_gatt_char(0x15, self.MSG_GET_COLOR, response=True)
+
+            try:
+                await asyncio.wait_for(on_status_ready.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                _LOGGER.debug("Status response timeout for %s", device_name)
+                return
 
         except Exception as e:
             _LOGGER.debug("Error querying status for %s: %s", device_name, e)
@@ -461,11 +483,7 @@ class GoveePlugLight(GoveePlugEntity, LightEntity):
         # Light is available if we have brightness data
         _, brightness = self.coordinator.api.get_light_state()
         is_available = brightness is not None
-        _LOGGER.debug(
-            "GoveePlugLight.available: brightness=%s, is_available=%s",
-            brightness,
-            is_available
-        )
+
         return is_available
 
     @property
