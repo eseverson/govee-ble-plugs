@@ -145,10 +145,13 @@ class GoveePlugDataUpdateCoordinator(PassiveBluetoothDataUpdateCoordinator):
 
     async def _async_poll_device_status(self) -> None:
         """Periodically poll device status to keep entities up to date."""
+        first_poll = True
         while self._polling_enabled:
             try:
-                # Use current backoff interval (which may be increased due to failures)
-                await asyncio.sleep(self._current_backoff)
+                # Skip sleep on first poll to get immediate status update on startup
+                if not first_poll:
+                    await asyncio.sleep(self._current_backoff)
+                first_poll = False
 
                 if not self._polling_enabled:
                     break
