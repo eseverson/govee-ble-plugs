@@ -212,62 +212,62 @@ class GoveePlugH6163(GoveePlugH6xxx):
             adv.manufacturer_data is not None and len(adv.manufacturer_data) > 0
         )
 
-        # Ensure device is initialized with default brightness on first discovery
-        # This makes entity available even without manufacturer data
-        if self._brightness is None:
-            self._brightness = 255
-            _LOGGER.debug(
-                "H6163 %s: Device discovered, initializing brightness to %d (no state data yet)",
-                device.address,
-                self._brightness
-            )
+        # # Ensure device is initialized with default brightness on first discovery
+        # # This makes entity available even without manufacturer data
+        # if self._brightness is None:
+        #     self._brightness = 255
+        #     _LOGGER.debug(
+        #         "H6163 %s: Device discovered, initializing brightness to %d (no state data yet)",
+        #         device.address,
+        #         self._brightness
+        #     )
 
-        if not adv.manufacturer_data:
-            _LOGGER.debug(
-                "H6163 %s: No manufacturer_data in advertisement (mfr_data=%s)",
-                device.address,
-                adv.manufacturer_data
-            )
-            return
+        # if not adv.manufacturer_data:
+        #     _LOGGER.debug(
+        #         "H6163 %s: No manufacturer_data in advertisement (mfr_data=%s)",
+        #         device.address,
+        #         adv.manufacturer_data
+        #     )
+        #     return
 
-        for mfr_id, mfr_data in adv.manufacturer_data.items():
-            _LOGGER.debug(
-                "H6163 %s: Received manufacturer data - mfr_id=%d(0x%04x), data=%s, len=%d",
-                device.address,
-                mfr_id,
-                mfr_id,
-                mfr_data.hex(),
-                len(mfr_data)
-            )
-            self._device = device
-            if len(mfr_data) > 0:
-                new_state = mfr_data[-1] == 0x01
-                self._is_on = new_state
+        # for mfr_id, mfr_data in adv.manufacturer_data.items():
+        #     _LOGGER.debug(
+        #         "H6163 %s: Received manufacturer data - mfr_id=%d(0x%04x), data=%s, len=%d",
+        #         device.address,
+        #         mfr_id,
+        #         mfr_id,
+        #         mfr_data.hex(),
+        #         len(mfr_data)
+        #     )
+        #     self._device = device
+        #     if len(mfr_data) > 0:
+        #         new_state = mfr_data[-1] == 0x01
+        #         self._is_on = new_state
 
-                # Update brightness based on manufacturer data state
-                if new_state is False and old_state is True:
-                    # Device turned off - sync brightness to 0
-                    self._brightness = 0
-                    _LOGGER.debug(
-                        "H6163 %s: Synced brightness to 0 (device turned off)",
-                        device.address
-                    )
+        #         # Update brightness based on manufacturer data state
+        #         if new_state is False and old_state is True:
+        #             # Device turned off - sync brightness to 0
+        #             self._brightness = 0
+        #             _LOGGER.debug(
+        #                 "H6163 %s: Synced brightness to 0 (device turned off)",
+        #                 device.address
+        #             )
 
-                if old_state != new_state:
-                    _LOGGER.info(
-                        "H6163 %s: State changed from advertisement - is_on=%s (was=%s, mfr_data=%s)",
-                        device.address,
-                        new_state,
-                        old_state,
-                        mfr_data.hex()
-                    )
-                else:
-                    _LOGGER.debug(
-                        "H6163 %s: State updated from advertisement - is_on=%s (mfr_data=%s)",
-                        device.address,
-                        new_state,
-                        mfr_data.hex()
-                    )
+        #         if old_state != new_state:
+        #             _LOGGER.info(
+        #                 "H6163 %s: State changed from advertisement - is_on=%s (was=%s, mfr_data=%s)",
+        #                 device.address,
+        #                 new_state,
+        #                 old_state,
+        #                 mfr_data.hex()
+        #             )
+        #         else:
+        #             _LOGGER.debug(
+        #                 "H6163 %s: State updated from advertisement - is_on=%s (mfr_data=%s)",
+        #                 device.address,
+        #                 new_state,
+        #                 mfr_data.hex()
+        #             )
 
     async def async_turn_on(self, port: int):
         assert port == 0
@@ -382,10 +382,14 @@ class GoveePlugH6163(GoveePlugH6xxx):
                     self._rgb = (data[3], data[4], data[5])
                     _LOGGER.debug("Color response: rgb=%s, data[2]=%d", self._rgb, data[2])
                     on_status_ready.set()
-                elif data[0] == 0x33 and data[1] == 0x01:
+                elif data[0] == 0xaa and data[1] == 0x01:
+                    _LOGGER.debug("On/off response received for %s: is_on=%s", device_name, data[2] == 0x01)
+                    self._is_on = data[2] == 0x01
                     # Status response received
                     # status_data[0] = data
                     on_status_ready.set()
+                else:
+                    _LOGGER.debug("Unexpected data format in status query response from %s: %s", device_name, data.hex())
 
             _LOGGER.debug("listening to uuid %s for status response from %s", self._RECV_CHARACTERISTIC_UUID, device_name)
             await client.start_notify(self._RECV_CHARACTERISTIC_UUID, recv_handler)
@@ -400,6 +404,7 @@ class GoveePlugH6163(GoveePlugH6xxx):
                 _LOGGER.debug("Status response timeout for %s", device_name)
                 return
 
+            on_status_ready.clear()
             _LOGGER.debug("Brightness query successful, now querying color for %s", device_name)
             # await client.start_notify(self._RECV_CHARACTERISTIC_UUID, recv_handler)
             await client.write_gatt_char(0x15, self.MSG_GET_COLOR, response=True)
@@ -408,6 +413,17 @@ class GoveePlugH6163(GoveePlugH6xxx):
                 await asyncio.wait_for(on_status_ready.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 _LOGGER.debug("Status response timeout for %s", device_name)
+                return
+
+            on_status_ready.clear()
+            _LOGGER.debug("Color query successful for %s, now sending keep alive", device_name)
+            await client.write_gatt_char(0x15, self.MSG_KEEP_ALIVE, response=True)
+
+            try:
+                await asyncio.wait_for(on_status_ready.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                _LOGGER.debug("Keep alive response timeout for %s (this may be normal)", device_name)
+                # Keep alive response is not critical, so we can ignore timeout here
                 return
 
         except Exception as e:
@@ -514,9 +530,8 @@ class GoveePlugLight(GoveePlugEntity, LightEntity):
         """Return true if light is on."""
         if not self.coordinator.api:
             return None
-        # Light is considered on if brightness is set
-        _, brightness = self.coordinator.api.get_light_state()
-        return brightness is not None and brightness > 0
+        # Use the actual device on/off state from polling/commands
+        return self.coordinator.api._is_on
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on or control the light."""
@@ -528,6 +543,8 @@ class GoveePlugLight(GoveePlugEntity, LightEntity):
         # If an effect is requested, set it and return (effects handle their own brightness/color)
         if effect := kwargs.get("effect"):
             await self.coordinator.api.async_set_effect(effect)
+            # Update on state immediately
+            self.coordinator.api._is_on = True
             self.async_write_ha_state()
             return
 
@@ -560,6 +577,9 @@ class GoveePlugLight(GoveePlugEntity, LightEntity):
         # Clear effect when setting manual color/brightness
         await self.coordinator.api.async_set_effect("normal")
 
+        # Update on state immediately to reflect the turn-on action
+        self.coordinator.api._is_on = True
+
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
@@ -569,6 +589,7 @@ class GoveePlugLight(GoveePlugEntity, LightEntity):
 
         # Use the proper turn off command instead of setting brightness to 0
         await self.coordinator.api.async_turn_off(0)
-        # Update brightness state to reflect off
+        # Update state to reflect off
         self.coordinator.api._brightness = 0
+        self.coordinator.api._is_on = False
         self.async_write_ha_state()
