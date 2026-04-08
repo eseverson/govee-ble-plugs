@@ -1,59 +1,40 @@
+"""Switch platform shim for govee-ble-plugs migration.
+
+This re-exports the switch platform from the new govee_ble_plugs domain.
+"""
 from __future__ import annotations
 
-from typing import Any
+import importlib.util
+import sys
+from pathlib import Path
 
-from homeassistant.components.switch import SwitchEntity, SwitchDeviceClass
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import (
-    AddEntitiesCallback,
-)
+# Load switch module from new domain
+def _get_new_domain_switch_module():
+    """Load the new domain's switch module."""
+    module_key = "homeassistant.components.govee_ble_plugs.switch"
 
-from .const import DOMAIN
-from .coordinator import GoveePlugDataUpdateCoordinator
-from .entity import GoveePlugEntity
+    if module_key in sys.modules:
+        return sys.modules[module_key]
 
+    custom_components_dir = Path(__file__).parent.parent
+    switch_path = custom_components_dir / "govee_ble_plugs" / "switch.py"
 
-async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
-) -> None:
-    """Set up govee plug based on a config entry."""
-    entry_data = hass.data[DOMAIN][entry.entry_id]
-    coordinator: GoveePlugDataUpdateCoordinator = entry_data["coordinator"]
-    entities = []
-    if coordinator.api:
-        port_names = coordinator.api.port_names()
-    else:
-        port_names = [(None, None)]
+    if not switch_path.exists():
+        raise RuntimeError(f"Switch module not found at {switch_path}")
 
-    for port, port_name in port_names:
-        entities.append(GoveePlugSwitch(coordinator, entry, port, port_name))
-    async_add_entities(entities)
+    spec = importlib.util.spec_from_file_location(module_key, switch_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not create module spec for {switch_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_key] = module
+    spec.loader.exec_module(module)
+
+    return module
 
 
-class GoveePlugSwitch(GoveePlugEntity, SwitchEntity):
-    """Govee switch class."""
+# Re-export the public API
+_switch_module = _get_new_domain_switch_module()
+async_setup_entry = _switch_module.async_setup_entry
 
-    _attr_device_class = SwitchDeviceClass.OUTLET
-    _attr_translation_key = "power"
-
-    async def async_turn_on(self, **kwargs: Any) -> None:
-        """Turn on the switch."""
-        if not self.coordinator.api:
-            return
-        await self.coordinator.api.async_turn_on(self._port)
-        self.async_write_ha_state()
-
-    async def async_turn_off(self, **kwargs: Any) -> None:
-        """Turn off the switch."""
-        if not self.coordinator.api:
-            return
-        await self.coordinator.api.async_turn_off(self._port)
-        self.async_write_ha_state()
-
-    @property
-    def is_on(self) -> bool | None:
-        """Return true if the switch is on."""
-        if not self.coordinator.api:
-            return None
-        return self.coordinator.api.is_on(self._port)
+__all__ = ["async_setup_entry"]
