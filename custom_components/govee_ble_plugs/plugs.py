@@ -174,7 +174,17 @@ class GoveePlugH508x:
         f = asyncio.Future[bool]()
         self._msgqueue.put_nowait((msg, f))
         self._ensure_message_task()
-        return await f
+        try:
+            # shield: a caller-side cancel/timeout must not cancel the future
+            # the message task will still try to fulfill from the BLE side
+            return await asyncio.wait_for(asyncio.shield(f), timeout=45.0)
+        except asyncio.TimeoutError:
+            _LOGGER.error(
+                "timed out waiting for plug to acknowledge: %s (%s)",
+                self._device.name,
+                self._device.address,
+            )
+            return False
 
     def _ensure_message_task(self):
         if not self._connection_task:
@@ -251,16 +261,25 @@ class GoveePlugH508x:
             )
             ba.append(_sign_payload(ba))
             await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, ba)
-            await on_auth_ready.wait()
+            try:
+                await asyncio.wait_for(on_auth_ready.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                _LOGGER.error("authentication timeout for %s", device_name)
+                while not must_process.empty():
+                    _, f = must_process.get_nowait()
+                    f.set_result(False)
+                return
 
             #
             # Send messages after authentication occurs
             #
 
             async def _send_msg(msg: bytes, f: asyncio.Future):
+                # clear so each write waits for its own ack, not a stale one
+                on_set_state_ready.clear()
                 try:
                     await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, msg)
-                    await on_set_state_ready.wait()
+                    await asyncio.wait_for(on_set_state_ready.wait(), timeout=5.0)
                 except Exception:
                     f.set_result(False)
                     raise
