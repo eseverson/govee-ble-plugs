@@ -2,12 +2,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import queue
 import typing as T
 
 from typing import Any
 
 _LOGGER = logging.getLogger(__package__)
+
+# Keep the connection open only briefly after the last command. A rapid drag
+# (writes <1s apart) keeps resetting this and reuses one connection, but we let
+# it go quickly when idle: this bulb drops the link itself after ~2s, and a
+# longer hold just leaves a dead client whose writes fail with "characteristic
+# not found" and silently lose the command (e.g. a turn-off that never applies).
+IDLE_DISCONNECT_SECONDS = 1
+# Hard cap on one connect cycle. bleak-retry-connector ignores max_attempts for
+# "transient" proxy errors and can retry ~9 times (~25s), stalling every queued
+# command behind it; this bounds that.
+CONNECT_TIMEOUT_SECONDS = 12
+# How many times to (re)connect and rewrite a single command before giving up.
+# The bulb drops idle connections, so a write can hit a stale client; retrying
+# on a fresh connection keeps commands from being silently lost.
+MAX_COMMAND_ATTEMPTS = 3
 
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
@@ -25,6 +39,7 @@ from homeassistant.helpers.entity_platform import (
     AddEntitiesCallback,
 )
 from homeassistant.exceptions import ConfigEntryError
+from homeassistant.util.color import color_temperature_to_rgb
 
 from .const import DOMAIN
 from .coordinator import GoveePlugDataUpdateCoordinator
@@ -87,89 +102,85 @@ class GoveePlugH6xxx:
             self._ensure_message_task()
 
     async def _message_task_fn(self):
-        client = None
-        must_process = queue.Queue[T.Tuple[bytes, asyncio.Future]]()
         device_name = f"{self._device.name} ({self._device.address})"
+        client = None
 
-        try:
-            # Pull anything on the message queue directly off, these must
-            # be processed one way or another
-            while not self._msgqueue.empty():
-                must_process.put(self._msgqueue.get_nowait())
-
-            # Use connection lock to prevent concurrent connection attempts
-            async with self._connection_lock:
-                try:
-                    client = await establish_connection(
-                        BleakClient,
-                        self._device,
-                        device_name,
-                        max_attempts=2,  # Reduced to 2 to fail faster and free slots
-                        connection_timeout=10.0,  # 10 second timeout per attempt
-                    )
-                except BleakOutOfConnectionSlotsError as e:
-                    _LOGGER.error(
-                        "failed to set state: %s - No available connection slots. "
-                        "Please disconnect unused devices or add more BLE proxies.",
-                        device_name
-                    )
-                    # Mark all pending messages as failed
-                    while not must_process.empty():
-                        _, f = must_process.get_nowait()
-                        f.set_result(False)
-                    return
-                except Exception as e:
-                    _LOGGER.error("failed to connect to %s: %s", device_name, e)
-                    # Mark all pending messages as failed
-                    while not must_process.empty():
-                        _, f = must_process.get_nowait()
-                        f.set_result(False)
-                    return
-
-            async def _send_msg(msg: bytes, f: asyncio.Future):
-                try:
-                    await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, msg)
-                except Exception:
-                    f.set_result(False)
-                    raise
-                else:
-                    f.set_result(True)
-
-            # Process must process entries first
-            while not must_process.empty():
-                msg, f = must_process.get_nowait()
-                await _send_msg(msg, f)
-
-            # Then process anything else that might be in the queue
-            while True:
-                try:
-                    msg, f = await asyncio.wait_for(self._msgqueue.get(), timeout=1)
-                except TimeoutError:
-                    break
-                else:
-                    await _send_msg(msg, f)
-
-            # H6xxx devices don't use notifications, so don't try to stop
-
-        except Exception as e:
-            _LOGGER.error("failed to set state for %s: %s", device_name, e)
-        finally:
-            # We only force clearing the must process queue. Anything that
-            # was queued while the connection was failing deserves another try
-            # and will be requeued when this task's done callback is called
-            while not must_process.empty():
-                _, f = must_process.get_nowait()
-                f.set_result(False)
-
+        async def _ensure_client():
+            """Return a live client, (re)connecting if needed. Raises on failure."""
+            nonlocal client
+            if client is not None and client.is_connected:
+                return client
             if client is not None:
                 try:
-                    # Ensure we disconnect to free up the connection slot
+                    await client.disconnect()
+                except Exception:
+                    pass
+                client = None
+            async with self._connection_lock:
+                client = await asyncio.wait_for(
+                    establish_connection(
+                        BleakClient, self._device, device_name, max_attempts=1
+                    ),
+                    timeout=CONNECT_TIMEOUT_SECONDS,
+                )
+            return client
+
+        async def _deliver(msg: bytes, f: asyncio.Future):
+            """Write a command, reconnecting and retrying on failure.
+
+            The bulb drops idle connections, so a write can hit a stale client
+            ("characteristic not found"). Retrying on a fresh connection keeps
+            commands from being silently lost; we give up (logged) after
+            MAX_COMMAND_ATTEMPTS rather than hanging or dropping silently.
+            """
+            nonlocal client
+            last_err = None
+            for attempt in range(1, MAX_COMMAND_ATTEMPTS + 1):
+                try:
+                    c = await _ensure_client()
+                    await c.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, msg)
+                except Exception as e:
+                    last_err = e
+                    _LOGGER.debug(
+                        "H6163 %s: attempt %d/%d failed for %s: %s",
+                        device_name, attempt, MAX_COMMAND_ATTEMPTS, msg.hex(), e,
+                    )
+                    client = None  # force a fresh connection on the next attempt
+                    continue
+                else:
+                    if not f.done():
+                        f.set_result(True)
+                    return
+            _LOGGER.error(
+                "H6163 %s: gave up on command %s after %d attempts: %s",
+                device_name, msg.hex(), MAX_COMMAND_ATTEMPTS, last_err,
+            )
+            if not f.done():
+                f.set_result(False)
+
+        try:
+            # Drain whatever is already queued, then keep serving briefly so an
+            # active drag reuses the warm connection instead of reconnecting.
+            while not self._msgqueue.empty():
+                msg, f = self._msgqueue.get_nowait()
+                await _deliver(msg, f)
+
+            while True:
+                try:
+                    msg, f = await asyncio.wait_for(
+                        self._msgqueue.get(), timeout=IDLE_DISCONNECT_SECONDS
+                    )
+                except TimeoutError:
+                    break
+                await _deliver(msg, f)
+        finally:
+            if client is not None:
+                try:
                     if client.is_connected:
                         await client.disconnect()
-                    # Give a small delay to ensure the slot is released
                     await asyncio.sleep(0.1)
-                except Exception as e:
-                    _LOGGER.debug("Error disconnecting %s: %s", device_name, e)
+                except Exception:
+                    pass
 
 
 class GoveePlugH6163(GoveePlugH6xxx):
@@ -194,7 +205,9 @@ class GoveePlugH6163(GoveePlugH6xxx):
         self._rgb: T.Optional[tuple[int, int, int]] = None
         self._brightness: T.Optional[int] = None
         self._last_brightness: int = 255  # Track last non-zero brightness for restore
-        self._effect: T.Optional[str] = "normal"
+        self._effect: T.Optional[str] = "Normal"
+        self._color_temp_kelvin: T.Optional[int] = None
+        self._color_mode: str = "rgb"  # active mode: "rgb" or "color_temp"
 
     def port_names(self) -> T.List[T.Tuple[T.Optional[int], T.Optional[str]]]:
         # H6163 is a light device, not a plug - no switch entities
@@ -204,70 +217,10 @@ class GoveePlugH6163(GoveePlugH6xxx):
         return self._is_on
 
     def handle_bluetooth_event(self, device: BLEDevice, adv: AdvertisementData):
-        old_state = self._is_on
-
-        _LOGGER.debug(
-            "H6163 handle_bluetooth_event called for %s, manufacturer_data present: %s",
-            device.address,
-            adv.manufacturer_data is not None and len(adv.manufacturer_data) > 0
-        )
-
-        # # Ensure device is initialized with default brightness on first discovery
-        # # This makes entity available even without manufacturer data
-        # if self._brightness is None:
-        #     self._brightness = 255
-        #     _LOGGER.debug(
-        #         "H6163 %s: Device discovered, initializing brightness to %d (no state data yet)",
-        #         device.address,
-        #         self._brightness
-        #     )
-
-        # if not adv.manufacturer_data:
-        #     _LOGGER.debug(
-        #         "H6163 %s: No manufacturer_data in advertisement (mfr_data=%s)",
-        #         device.address,
-        #         adv.manufacturer_data
-        #     )
-        #     return
-
-        # for mfr_id, mfr_data in adv.manufacturer_data.items():
-        #     _LOGGER.debug(
-        #         "H6163 %s: Received manufacturer data - mfr_id=%d(0x%04x), data=%s, len=%d",
-        #         device.address,
-        #         mfr_id,
-        #         mfr_id,
-        #         mfr_data.hex(),
-        #         len(mfr_data)
-        #     )
-        #     self._device = device
-        #     if len(mfr_data) > 0:
-        #         new_state = mfr_data[-1] == 0x01
-        #         self._is_on = new_state
-
-        #         # Update brightness based on manufacturer data state
-        #         if new_state is False and old_state is True:
-        #             # Device turned off - sync brightness to 0
-        #             self._brightness = 0
-        #             _LOGGER.debug(
-        #                 "H6163 %s: Synced brightness to 0 (device turned off)",
-        #                 device.address
-        #             )
-
-        #         if old_state != new_state:
-        #             _LOGGER.info(
-        #                 "H6163 %s: State changed from advertisement - is_on=%s (was=%s, mfr_data=%s)",
-        #                 device.address,
-        #                 new_state,
-        #                 old_state,
-        #                 mfr_data.hex()
-        #             )
-        #         else:
-        #             _LOGGER.debug(
-        #                 "H6163 %s: State updated from advertisement - is_on=%s (mfr_data=%s)",
-        #                 device.address,
-        #                 new_state,
-        #                 mfr_data.hex()
-        #             )
+        # The H6163 doesn't report usable state in its advertisements; on/off,
+        # brightness and colour are tracked optimistically and seeded via
+        # async_query_status. Just keep the BLEDevice reference fresh.
+        self._device = device
 
     async def async_turn_on(self, port: int):
         assert port == 0
@@ -283,11 +236,6 @@ class GoveePlugH6163(GoveePlugH6xxx):
         return True
 
     def get_light_state(self) -> T.Tuple[T.Optional[tuple[int, int, int]], T.Optional[int]]:
-        # _LOGGER.debug(
-        #     "H6163 get_light_state: rgb=%s, brightness=%s",
-        #     self._rgb,
-        #     self._brightness
-        # )
         return self._rgb, self._brightness
 
     async def async_set_light_rgb(self, rgb: tuple[int, int, int]) -> None:
@@ -303,6 +251,38 @@ class GoveePlugH6163(GoveePlugH6xxx):
 
         if await self._send_message(bytes(msg)):
             self._rgb = rgb
+            self._color_mode = "rgb"
+            self._color_temp_kelvin = None
+
+    def get_color_mode(self) -> str:
+        """Return the active color mode: 'rgb' or 'color_temp'."""
+        return self._color_mode
+
+    def get_color_temp_kelvin(self) -> T.Optional[int]:
+        return self._color_temp_kelvin
+
+    async def async_set_light_color_temp(self, kelvin: int) -> None:
+        """Set white color temperature (Kelvin).
+
+        The H6163 has no dedicated white channel exposed over BLE, so the
+        temperature is sent as a manual-mode (0x05/0x02) color whose RGB is
+        computed from the Kelvin value. Packet form 0x33 0x05 0x02 FF FF FF 01
+        R G B is corroborated by wez/govee-py and chvolkmann/govee_btled.
+        """
+        red, green, blue = (int(c) for c in color_temperature_to_rgb(kelvin))
+        msg = bytearray(
+            [0x33, 0x05, 0x02, 0xFF, 0xFF, 0xFF, 0x01, red, green, blue]
+            + [0x00] * 9
+        )
+        msg.append(_sign_payload(msg))
+        _LOGGER.debug(
+            "H6163 set color_temp %dK -> rgb=(%d,%d,%d) packet=%s",
+            kelvin, red, green, blue, msg.hex(),
+        )
+        if await self._send_message(bytes(msg)):
+            self._color_temp_kelvin = kelvin
+            self._rgb = (red, green, blue)
+            self._color_mode = "color_temp"
 
     async def async_set_light_brightness(self, brightness: int) -> None:
         """Set brightness. Brightness should be in range 0-255."""
@@ -325,21 +305,21 @@ class GoveePlugH6163(GoveePlugH6xxx):
         """Set effect mode. Returns None if effect is not recognized."""
         # Effect mappings
         effects = {
-            "normal": _b("3301010000000000000000000000000000000033"),
-            "music_energetic": _b("3305010000000000000000000000000000000037"),
-            "music_spectrum_red": _b("3305010100ff00000000000000000000000000c9"),
-            "music_spectrum_blue": _b("33050101000000ff0000000000000000000000c9"),
-            "music_rolling_red": _b("33050102ff0000000000000000000000000000ca"),
-            "music_rolling_blue": _b("330501020000ff000000000000000000000000ca"),
-            "music_rhythm": _b("3305010300000000000000000000000000000034"),
-            "scene_sunrise": _b("3305040000000000000000000000000000000032"),
-            "scene_sunset": _b("3305040100000000000000000000000000000033"),
-            "scene_movie": _b("3305040400000000000000000000000000000036"),
-            "scene_dating": _b("3305040500000000000000000000000000000037"),
-            "scene_romantic": _b("3305040700000000000000000000000000000035"),
-            "scene_blinking": _b("330504080000000000000000000000000000003a"),
-            "scene_candlelight": _b("330504090000000000000000000000000000003b"),
-            "scene_snowflake": _b("3305040f0000000000000000000000000000003d"),
+            "Normal": _b("3301010000000000000000000000000000000033"),
+            "Music - Energetic": _b("3305010000000000000000000000000000000037"),
+            "Music - Spectrum (Red)": _b("3305010100ff00000000000000000000000000c9"),
+            "Music - Spectrum (Blue)": _b("33050101000000ff0000000000000000000000c9"),
+            "Music - Rolling (Red)": _b("33050102ff0000000000000000000000000000ca"),
+            "Music - Rolling (Blue)": _b("330501020000ff000000000000000000000000ca"),
+            "Music - Rhythm": _b("3305010300000000000000000000000000000034"),
+            "Sunrise": _b("3305040000000000000000000000000000000032"),
+            "Sunset": _b("3305040100000000000000000000000000000033"),
+            "Movie": _b("3305040400000000000000000000000000000036"),
+            "Dating": _b("3305040500000000000000000000000000000037"),
+            "Romantic": _b("3305040700000000000000000000000000000035"),
+            "Blinking": _b("330504080000000000000000000000000000003a"),
+            "Candlelight": _b("330504090000000000000000000000000000003b"),
+            "Snowflake": _b("3305040f0000000000000000000000000000003d"),
         }
 
         if effect not in effects:
@@ -348,11 +328,11 @@ class GoveePlugH6163(GoveePlugH6xxx):
         if await self._send_message(effects[effect]):
             self._effect = effect
 
-    async def async_query_status(self) -> None:
-        """Query the current status of the device."""
+    async def async_query_status(self) -> bool:
+        """Query current status. Returns True if state (brightness) was seeded."""
         client = None
         device_name = f"{self._device.name} ({self._device.address})"
-        # status_data = [None]
+        got_state = False
 
         try:
             async with self._connection_lock:
@@ -366,7 +346,7 @@ class GoveePlugH6163(GoveePlugH6xxx):
                     )
                 except (BleakOutOfConnectionSlotsError, Exception) as e:
                     _LOGGER.debug("failed to connect for status query to %s: %s", device_name, e)
-                    return
+                    return False
 
             on_status_ready = asyncio.Event()
 
@@ -385,8 +365,6 @@ class GoveePlugH6163(GoveePlugH6xxx):
                 elif data[0] == 0xaa and data[1] == 0x01:
                     _LOGGER.debug("On/off response received for %s: is_on=%s", device_name, data[2] == 0x01)
                     self._is_on = data[2] == 0x01
-                    # Status response received
-                    # status_data[0] = data
                     on_status_ready.set()
                 else:
                     _LOGGER.debug("Unexpected data format in status query response from %s: %s", device_name, data.hex())
@@ -395,25 +373,24 @@ class GoveePlugH6163(GoveePlugH6xxx):
             await client.start_notify(self._RECV_CHARACTERISTIC_UUID, recv_handler)
 
             # H6163 doesn't require authentication, send query directly
-            # await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, self.MSG_QUERY_STATUS)
             await client.write_gatt_char(0x15, self.MSG_GET_BRIGHTNESS, response=False)
 
             try:
                 await asyncio.wait_for(on_status_ready.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 _LOGGER.debug("Status response timeout for %s", device_name)
-                return
+                return False
 
+            got_state = True
             on_status_ready.clear()
             _LOGGER.debug("Brightness query successful, now querying color for %s", device_name)
-            # await client.start_notify(self._RECV_CHARACTERISTIC_UUID, recv_handler)
             await client.write_gatt_char(0x15, self.MSG_GET_COLOR, response=True)
 
             try:
                 await asyncio.wait_for(on_status_ready.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 _LOGGER.debug("Status response timeout for %s", device_name)
-                return
+                return got_state
 
             on_status_ready.clear()
             _LOGGER.debug("Color query successful for %s, now sending keep alive", device_name)
@@ -424,10 +401,13 @@ class GoveePlugH6163(GoveePlugH6xxx):
             except asyncio.TimeoutError:
                 _LOGGER.debug("Keep alive response timeout for %s (this may be normal)", device_name)
                 # Keep alive response is not critical, so we can ignore timeout here
-                return
+                return got_state
+
+            return got_state
 
         except Exception as e:
             _LOGGER.debug("Error querying status for %s: %s", device_name, e)
+            return got_state
         finally:
             if client is not None:
                 try:
@@ -460,47 +440,53 @@ async def async_setup_entry(
 class GoveePlugLight(GoveePlugEntity, LightEntity):
     """Govee light class."""
 
-    _attr_supported_color_modes = {ColorMode.RGB}
+    _attr_supported_color_modes = {ColorMode.RGB, ColorMode.COLOR_TEMP}
     _attr_supported_features = LightEntityFeature.EFFECT
+    # Govee's app exposes ~2000-9000K for these bulbs; widen if a model differs.
+    _attr_min_color_temp_kelvin = 2000
+    _attr_max_color_temp_kelvin = 9000
     _attr_translation_key = "led"
     _attr_effect_list = [
-        "normal",
-        "music_energetic",
-        "music_spectrum_red",
-        "music_spectrum_blue",
-        # "music_rolling_red",
-        # "music_rolling_blue",
-        "music_rhythm",
-        "scene_sunrise",
-        "scene_sunset",
-        "scene_movie",
-        "scene_dating",
-        "scene_romantic",
-        "scene_blinking",
-        "scene_candlelight",
-        "scene_snowflake",
+        "Normal",
+        "Music - Energetic",
+        "Music - Spectrum (Red)",
+        "Music - Spectrum (Blue)",
+        # "Music - Rolling (Red)",
+        # "Music - Rolling (Blue)",
+        "Music - Rhythm",
+        "Sunrise",
+        "Sunset",
+        "Movie",
+        "Dating",
+        "Romantic",
+        "Blinking",
+        "Candlelight",
+        "Snowflake",
     ]
 
     @property
     def color_mode(self) -> ColorMode:
-        """Return the color mode of the light."""
+        """Return the currently active color mode."""
+        if self.coordinator.api and self.coordinator.api.get_color_mode() == "color_temp":
+            return ColorMode.COLOR_TEMP
         return ColorMode.RGB
 
     @property
-    def available(self) -> bool:
-        """Return if entity is available.
-
-        Light is available when API is initialized and we have valid state data.
-        """
+    def color_temp_kelvin(self) -> int | None:
+        """Return the current color temperature in Kelvin."""
         if not self.coordinator.api:
-            _LOGGER.debug("GoveePlugLight.available: API not initialized, returning False")
-            return False
+            return None
+        return self.coordinator.api.get_color_temp_kelvin()
 
-        # Light is available if we have brightness data
-        _, brightness = self.coordinator.api.get_light_state()
-        is_available = brightness is not None
+    @property
+    def available(self) -> bool:
+        """Available once the device has been discovered.
 
-        return is_available
+        Deliberately NOT gated on polled state. The light is controlled
+        optimistically, so requiring a successful status poll would make it go
+        unavailable whenever polling is slow or disabled.
+        """
+        return self.coordinator.api is not None
 
     @property
     def rgb_color(self) -> tuple[int, int, int] | None:
@@ -548,6 +534,18 @@ class GoveePlugLight(GoveePlugEntity, LightEntity):
             self.async_write_ha_state()
             return
 
+        # If a color temperature is requested, set white mode and return.
+        # The color command itself exits any active scene/effect, so mark it normal.
+        if (kelvin := kwargs.get("color_temp_kelvin")) is not None:
+            await self.coordinator.api.async_set_light_color_temp(kelvin)
+            new_brightness = kwargs.get("brightness")
+            if new_brightness and new_brightness != brightness:
+                await self.coordinator.api.async_set_light_brightness(new_brightness)
+            self.coordinator.api._effect = "Normal"
+            self.coordinator.api._is_on = True
+            self.async_write_ha_state()
+            return
+
         # Determine new RGB value
         new_rgb = kwargs.get("rgb_color", rgb)
         if new_rgb is None:
@@ -575,7 +573,7 @@ class GoveePlugLight(GoveePlugEntity, LightEntity):
             await self.coordinator.api.async_set_light_brightness(new_brightness)
 
         # Clear effect when setting manual color/brightness
-        await self.coordinator.api.async_set_effect("normal")
+        await self.coordinator.api.async_set_effect("Normal")
 
         # Update on state immediately to reflect the turn-on action
         self.coordinator.api._is_on = True

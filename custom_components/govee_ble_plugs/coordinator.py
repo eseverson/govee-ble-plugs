@@ -27,6 +27,12 @@ MAX_BACKOFF_INTERVAL = 300
 # Initial backoff multiplier
 BACKOFF_MULTIPLIER = 2
 
+# Startup state-seed poll, used when continuous polling is disabled so an
+# entity (e.g. the light) still shows real state after a restart.
+STARTUP_POLL_ATTEMPTS = 5
+STARTUP_POLL_RETRY_DELAY = 3  # seconds between startup poll attempts
+STARTUP_DISCOVERY_TICKS = 12  # POLLING_INTERVALs to wait for the device to appear
+
 
 class GoveePlugDataUpdateCoordinator(PassiveBluetoothDataUpdateCoordinator):
     """Class to manage fetching data from the plug."""
@@ -266,6 +272,44 @@ class GoveePlugDataUpdateCoordinator(PassiveBluetoothDataUpdateCoordinator):
                     self._current_backoff
                 )
 
+    async def _async_startup_poll(self) -> None:
+        """Seed current state with a single poll on startup.
+
+        Used when continuous polling is disabled, so an entity (e.g. the light,
+        whose state isn't carried by advertisements) shows real values after a
+        restart instead of nothing. Retries on this often-flaky link until it
+        actually gets state, then stops.
+        """
+        # Wait for the device to be discovered.
+        for _ in range(STARTUP_DISCOVERY_TICKS):
+            if not self._polling_enabled:
+                return
+            if self.api and self.ble_device:
+                break
+            await asyncio.sleep(POLLING_INTERVAL)
+        else:
+            return
+
+        for attempt in range(1, STARTUP_POLL_ATTEMPTS + 1):
+            if not self._polling_enabled:
+                return
+            try:
+                if await self.api.async_query_status():
+                    self.async_update_listeners()
+                    _LOGGER.debug("Startup poll seeded state for %s", self._address)
+                    return
+            except Exception as e:
+                _LOGGER.debug(
+                    "Startup poll attempt %d failed for %s: %s",
+                    attempt, self._address, e,
+                )
+            await asyncio.sleep(STARTUP_POLL_RETRY_DELAY)
+
+        _LOGGER.debug(
+            "Startup poll could not obtain state for %s after %d attempts",
+            self._address, STARTUP_POLL_ATTEMPTS,
+        )
+
     @callback
     def async_start(self) -> CALLBACK_TYPE:
         """Start coordinator and polling task.
@@ -285,10 +329,15 @@ class GoveePlugDataUpdateCoordinator(PassiveBluetoothDataUpdateCoordinator):
             self._enable_polling
         )
 
-        # Start polling task only if polling is enabled
-        if self._enable_polling and self._polling_task is None:
-            self._polling_task = asyncio.create_task(self._async_poll_device_status())
-            _LOGGER.debug("Started polling task for %s", self._address)
+        # Start the recurring polling loop if enabled; otherwise still run a
+        # one-time startup poll so entities show real state after a restart.
+        if self._polling_task is None:
+            if self._enable_polling:
+                self._polling_task = asyncio.create_task(self._async_poll_device_status())
+                _LOGGER.debug("Started polling task for %s", self._address)
+            else:
+                self._polling_task = asyncio.create_task(self._async_startup_poll())
+                _LOGGER.debug("Started startup-poll task for %s", self._address)
 
         # Return a cleanup function that stops both parent and our polling
         @callback
