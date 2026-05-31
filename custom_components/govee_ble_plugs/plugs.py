@@ -19,6 +19,18 @@ _LOGGER: logging.Logger = logging.getLogger(__package__)
 COMMAND_COOLDOWN_SECONDS = 3.0
 
 
+@dataclasses.dataclass
+class GoveePowerData:
+    """Power-monitoring snapshot from a Govee plug (currently the H5086)."""
+
+    time_on: T.Optional[int] = None       # seconds the outlet has been on
+    energy: T.Optional[float] = None      # Wh accumulated
+    voltage: T.Optional[float] = None     # V
+    current: T.Optional[float] = None     # A
+    power: T.Optional[float] = None       # W
+    power_factor: T.Optional[int] = None  # percent
+
+
 def _b(s: str):
     return bytes(bytearray.fromhex(s))
 
@@ -45,7 +57,7 @@ class GoveePlugApi(T.Protocol):
 
     async def async_turn_off(self, port: int): ...
 
-    async def async_query_status(self) -> None: ...
+    async def async_query_status(self) -> bool: ...
 
     # Optional light API methods (only H6163 implements these)
     def has_light(self) -> bool: ...
@@ -359,12 +371,16 @@ class GoveePlugH508x:
                 except Exception as e:
                     _LOGGER.debug("Error disconnecting %s: %s", device_name, e)
 
-    async def _query_status_internal(self, query_msg: bytes) -> bool:
-        """Internal method to query device status by connecting and sending a query message."""
+    async def _query_status_internal(self, query_msg: bytes, expect_power: bool = False) -> bool:
+        """Connect, authenticate, send a query, and parse the response.
+
+        When expect_power is True the call waits for an ee19 power frame
+        (H5086) instead of the usual 0x3301 status frame.
+        """
         client = None
         device_name = f"{self._device.name} ({self._device.address})"
-        status_received = asyncio.Event()
         status_data = [None]
+        power_data = [None]
 
         try:
             async with self._connection_lock:
@@ -383,14 +399,21 @@ class GoveePlugH508x:
             # Events to control execution flow
             on_auth_ready = asyncio.Event()
             on_status_ready = asyncio.Event()
+            on_power_ready = asyncio.Event()
 
             async def recv_handler(c, data):
+                if len(data) < 2:
+                    return
                 if data[0] == 0x33 and data[1] == 0xB2:
                     on_auth_ready.set()
                 elif data[0] == 0x33 and data[1] == 0x01:
                     # Status response received
                     status_data[0] = data
                     on_status_ready.set()
+                elif data[0] == 0xEE and data[1] == 0x19:
+                    # Power-monitoring response (H5086)
+                    power_data[0] = data
+                    on_power_ready.set()
 
             await client.start_notify(self._RECV_CHARACTERISTIC_UUID, recv_handler)
 
@@ -408,15 +431,18 @@ class GoveePlugH508x:
             # Send query message
             await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, query_msg)
 
+            wait_event = on_power_ready if expect_power else on_status_ready
             try:
-                await asyncio.wait_for(on_status_ready.wait(), timeout=3.0)
+                await asyncio.wait_for(wait_event.wait(), timeout=3.0)
             except asyncio.TimeoutError:
-                _LOGGER.debug("Status response timeout for %s", device_name)
+                _LOGGER.debug("Query response timeout for %s", device_name)
                 return False
 
-            # Parse status from response if available
+            # Parse whichever responses arrived
             if status_data[0] and len(status_data[0]) >= 3:
                 self._parse_status_response(status_data[0])
+            if power_data[0]:
+                self._parse_power_response(power_data[0])
 
             return True
 
@@ -439,6 +465,18 @@ class GoveePlugH508x:
     def _parse_status_response(self, data: bytearray) -> None:
         """Parse status response. Override in subclasses if needed."""
         # Default implementation - subclasses can override
+        pass
+
+    def supports_power_monitoring(self) -> bool:
+        """Whether this device reports power/energy data. Overridden by H5086."""
+        return False
+
+    def get_power_data(self) -> T.Optional[GoveePowerData]:
+        """Latest power snapshot, or None if unsupported."""
+        return None
+
+    def _parse_power_response(self, data: bytearray) -> None:
+        """Parse a power-monitoring response. Overridden by H5086."""
         pass
 
 # H6163 and H6xxx base class moved to light.py
@@ -557,9 +595,9 @@ class GoveePlugH5080(GoveePlugH508x):
     async def async_set_effect(self, effect: str):
         pass
 
-    async def async_query_status(self) -> None:
+    async def async_query_status(self) -> bool:
         """Query the current status of the device."""
-        await self._query_status_internal(self.MSG_QUERY_STATUS)
+        return await self._query_status_internal(self.MSG_QUERY_STATUS)
 
     def _parse_status_response(self, data: bytearray) -> None:
         """Parse status response from device."""
@@ -648,9 +686,9 @@ class GoveePlugH5083(GoveePlugH508x):
     async def async_set_effect(self, effect: str):
         pass
 
-    async def async_query_status(self) -> None:
+    async def async_query_status(self) -> bool:
         """Query the current status of the device."""
-        await self._query_status_internal(self.MSG_QUERY_STATUS)
+        return await self._query_status_internal(self.MSG_QUERY_STATUS)
 
     def _parse_status_response(self, data: bytearray) -> None:
         """Parse status response from device."""
@@ -769,9 +807,9 @@ class GoveePlugH5082(GoveePlugH508x):
     async def async_set_effect(self, effect: str):
         pass
 
-    async def async_query_status(self) -> None:
+    async def async_query_status(self) -> bool:
         """Query the current status of the device."""
-        await self._query_status_internal(self.MSG_QUERY_STATUS)
+        return await self._query_status_internal(self.MSG_QUERY_STATUS)
 
     def _parse_status_response(self, data: bytearray) -> None:
         """Parse status response from device."""
@@ -790,6 +828,8 @@ class GoveePlugH5086(GoveePlugH508x):
     MSG_TURN_ON = _b("3301010000000000000000000000000000000033")
     MSG_TURN_OFF = _b("3301000000000000000000000000000000000032")
     MSG_QUERY_STATUS = _b("3300000000000000000000000000000000000033")
+    # Request power-monitoring data; the device replies with an ee19 frame.
+    MSG_GET_POWER = _b("aa000000000000000000000000000000000000aa")
 
     SEND_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b11"
     RECV_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b10"
@@ -799,6 +839,7 @@ class GoveePlugH5086(GoveePlugH508x):
             device, token, self.RECV_CHARACTERISTIC_UUID, self.SEND_CHARACTERISTIC_UUID
         )
         self._is_on = None
+        self._power_data = GoveePowerData()
 
     def port_names(self) -> T.List[T.Tuple[T.Optional[int], T.Optional[str]]]:
         return [(None, None)]
@@ -868,9 +909,48 @@ class GoveePlugH5086(GoveePlugH508x):
     async def async_set_light_brightness(self, brightness: int):
         pass
 
-    async def async_query_status(self) -> None:
-        """Query the current status of the device."""
-        await self._query_status_internal(self.MSG_QUERY_STATUS)
+    def supports_power_monitoring(self) -> bool:
+        return True
+
+    def get_power_data(self) -> T.Optional[GoveePowerData]:
+        return self._power_data
+
+    async def async_query_status(self) -> bool:
+        """Actively poll power data; on/off state comes from advertisements."""
+        return await self._query_status_internal(self.MSG_GET_POWER, expect_power=True)
+
+    def _parse_power_response(self, data: bytearray) -> None:
+        """Parse an ee19 power-monitoring frame.
+
+        Layout (big-endian): ee19 [time:3][energy:3][voltage:2][current:2][power:3][factor:1]
+        - time: seconds the outlet has been on
+        - energy: 1/10 Wh
+        - voltage: 1/100 V
+        - current: 1/100 A
+        - power: 1/100 W
+        - power_factor: percent
+        (Protocol from nsheaps@'s H5086 work; unverified here.)
+        """
+        if len(data) < 16 or data[0] != 0xEE or data[1] != 0x19:
+            return
+        time_on = (data[2] << 16) | (data[3] << 8) | data[4]
+        energy = ((data[5] << 16) | (data[6] << 8) | data[7]) / 10.0
+        voltage = ((data[8] << 8) | data[9]) / 100.0
+        current = ((data[10] << 8) | data[11]) / 100.0
+        power = ((data[12] << 16) | (data[13] << 8) | data[14]) / 100.0
+        power_factor = data[15]
+        self._power_data = GoveePowerData(
+            time_on=time_on,
+            energy=energy,
+            voltage=voltage,
+            current=current,
+            power=power,
+            power_factor=power_factor,
+        )
+        _LOGGER.debug(
+            "H5086 %s power: %.2fV %.2fA %.2fW %.1fWh pf=%d%% on=%ds",
+            self._device.address, voltage, current, power, energy, power_factor, time_on,
+        )
 
     def _parse_status_response(self, data: bytearray) -> None:
         """Parse status response from device."""

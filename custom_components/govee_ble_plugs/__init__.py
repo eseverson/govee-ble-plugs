@@ -14,7 +14,7 @@ from .coordinator import GoveePlugDataUpdateCoordinator
 
 from .plugs import GoveePlugApi, get_api_by_model
 
-PLATFORMS: list[str] = [Platform.SWITCH, Platform.LIGHT]
+PLATFORMS: list[str] = [Platform.SWITCH, Platform.LIGHT, Platform.SENSOR]
 
 OLD_DOMAIN = "govee-ble-plugs"
 
