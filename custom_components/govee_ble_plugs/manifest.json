@@ -24,16 +24,16 @@
         }
     ],
     "codeowners": [
-        "@virtuald"
+        "@eseverson"
     ],
     "config_flow": true,
     "dependencies": [
         "bluetooth"
     ],
-    "documentation": "https://github.com/virtuald/govee-ble-plugs",
+    "documentation": "https://github.com/eseverson/govee-ble-plugs",
     "integration_type": "hub",
     "iot_class": "local_polling",
-    "issue_tracker": "https://github.com/virtuald/govee-ble-plugs/issues",
+    "issue_tracker": "https://github.com/eseverson/govee-ble-plugs/issues",
     "requirements": [
         "bleak-retry-connector"
     ],
