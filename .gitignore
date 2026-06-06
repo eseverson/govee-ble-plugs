@@ -5,3 +5,13 @@ pythonenv*
 venv
 .venv
 config
+
+# Firmware dump artifacts (large; eFuse contains device MACs/keys)
+*.bin
+out.txt
+# Reverse-engineering working artifacts (not for the public repo)
+re/
+
+# Internal RE / planning working docs (not for the public repo)
+docs/superpowers/
+.claude

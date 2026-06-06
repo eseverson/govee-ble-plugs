@@ -12,6 +12,8 @@ from bleak_retry_connector import establish_connection, BleakOutOfConnectionSlot
 
 from homeassistant.exceptions import ConfigEntryError
 
+from .session import GoveeBleSession, SessionError
+
 _LOGGER: logging.Logger = logging.getLogger(__package__)
 
 # Ignore BLE advertisements for this many seconds after sending a command, so a
@@ -94,6 +96,19 @@ def get_api_by_model(model: str, device: BLEDevice, token: str) -> GoveePlugApi:
         return GoveePlugH6163(device, token)
 
     raise ConfigEntryError(f"Unsupported model {model}")
+
+
+# Models whose state is NOT fully carried by BLE advertisements and therefore benefit from
+# active status polling. Currently only the H5086 (its power/energy/voltage/etc. sensors).
+# Everything else — the on/off plugs and the light — gets state from advertisements plus a
+# one-time startup poll, so polling defaults off for them (continuous polling there just churns
+# BLE connections, which is costly over BLE proxies / weak links).
+ACTIVE_POLLING_MODELS = {"H5086"}
+
+
+def default_enable_polling(model: str) -> bool:
+    """Default for a new config entry's 'enable_polling' option, by model."""
+    return model in ACTIVE_POLLING_MODELS
 
 
 def get_pair_by_model(model: str, device: BLEDevice) -> GoveePairApi:
@@ -289,47 +304,38 @@ class GoveePlugH508x:
                         f.set_result(False)
                     return
 
-            # events to control execution flow
-            on_auth_ready = asyncio.Event()
-            on_set_state_ready = asyncio.Event()
-
-            async def recv_handler(c, data):
-                if data[0] == 0x33 and data[1] == 0xB2:
-                    on_auth_ready.set()
-                elif data[0] == 0x33 and data[1] == 0x01:
-                    on_set_state_ready.set()
-
-            await client.start_notify(self._RECV_CHARACTERISTIC_UUID, recv_handler)
-
-            ba = bytearray([0x33, 0xB2]) + bytearray.fromhex(self._token).ljust(
-                17, b"\0"
+            # Post-OTA (fw 1.00.28+) units wrap everything in an encrypted session and
+            # require token auth; older units still speak plaintext. One session object
+            # handles both: probe the 0xE7 exchange, and on no reply fall back to identity
+            # framing in-place (no notify re-subscribe, which some BLE proxies reject 133).
+            session = GoveeBleSession(
+                client, self._SEND_CHARACTERISTIC_UUID, self._RECV_CHARACTERISTIC_UUID
             )
-            ba.append(_sign_payload(ba))
-            await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, ba)
+            await session.start()
             try:
-                await asyncio.wait_for(on_auth_ready.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                _LOGGER.error("authentication timeout for %s", device_name)
+                await session.open_session(timeout=5.0)
+                _LOGGER.debug("%s: using encrypted session protocol", device_name)
+            except SessionError:
+                session.set_plaintext()
+                _LOGGER.debug("%s: no session-key exchange; using legacy plaintext", device_name)
+
+            def _fail_all():
                 while not must_process.empty():
                     _, f = must_process.get_nowait()
                     f.set_result(False)
+
+            if not await session.authenticate(bytes.fromhex(self._token)):
+                _LOGGER.error("authentication timeout for %s", device_name)
+                _fail_all()
                 return
 
-            #
-            # Send messages after authentication occurs
-            #
-
             async def _send_msg(msg: bytes, f: asyncio.Future):
-                # clear so each write waits for its own ack, not a stale one
-                on_set_state_ready.clear()
                 try:
-                    await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, msg)
-                    await asyncio.wait_for(on_set_state_ready.wait(), timeout=5.0)
+                    ack = await session.send_command(msg, timeout=5.0)
                 except Exception:
                     f.set_result(False)
                     raise
-                else:
-                    f.set_result(True)
+                f.set_result(ack is not None)
 
             # Process must process entries first
             while not must_process.empty():
@@ -396,47 +402,25 @@ class GoveePlugH508x:
                     _LOGGER.debug("failed to connect for status query to %s: %s", device_name, e)
                     return False
 
-            # Events to control execution flow
-            on_auth_ready = asyncio.Event()
-            on_status_ready = asyncio.Event()
-            on_power_ready = asyncio.Event()
-
-            async def recv_handler(c, data):
-                if len(data) < 2:
-                    return
-                if data[0] == 0x33 and data[1] == 0xB2:
-                    on_auth_ready.set()
-                elif data[0] == 0x33 and data[1] == 0x01:
-                    # Status response received
-                    status_data[0] = data
-                    on_status_ready.set()
-                elif data[0] == 0xEE and data[1] == 0x19:
-                    # Power-monitoring response (H5086)
-                    power_data[0] = data
-                    on_power_ready.set()
-
-            await client.start_notify(self._RECV_CHARACTERISTIC_UUID, recv_handler)
-
-            # Authenticate
-            ba = bytearray([0x33, 0xB2]) + bytearray.fromhex(self._token).ljust(17, b"\0")
-            ba.append(_sign_payload(ba))
-            await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, ba)
-
+            # One session for both protocols: probe 0xE7, fall back to identity framing
+            # in-place (no notify re-subscribe).
+            session = GoveeBleSession(
+                client, self._SEND_CHARACTERISTIC_UUID, self._RECV_CHARACTERISTIC_UUID
+            )
+            await session.start()
             try:
-                await asyncio.wait_for(on_auth_ready.wait(), timeout=3.0)
-            except asyncio.TimeoutError:
-                _LOGGER.debug("Authentication timeout for status query to %s", device_name)
-                return False
+                await session.open_session(timeout=5.0)
+            except SessionError:
+                session.set_plaintext()
 
-            # Send query message
-            await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, query_msg)
-
-            wait_event = on_power_ready if expect_power else on_status_ready
-            try:
-                await asyncio.wait_for(wait_event.wait(), timeout=3.0)
-            except asyncio.TimeoutError:
-                _LOGGER.debug("Query response timeout for %s", device_name)
+            if not await session.authenticate(bytes.fromhex(self._token)):
+                _LOGGER.debug("Authentication failed for status query to %s", device_name)
                 return False
+            for frame in await session.query(query_msg, timeout=3.0):
+                if len(frame) >= 3 and frame[0] == 0x33 and frame[1] == 0x01:
+                    status_data[0] = frame
+                elif len(frame) >= 2 and frame[0] == 0xEE and frame[1] == 0x19:
+                    power_data[0] = frame
 
             # Parse whichever responses arrived
             if status_data[0] and len(status_data[0]) >= 3:
@@ -512,10 +496,11 @@ class GoveePlugH5080(GoveePlugH508x):
                 device.name or device.address,
             )
             return
-        # H5080 uses manufacturer ID 34818 (0x8802) for status advertisements
-        # Format: 0xEC 0x00 0x01 0x01 0x00 (off) or 0xEC 0x00 0x01 0x01 0x01 (on)
-        # Last byte indicates state: 0x00 = off, 0x01 = on
-        GOvee_MANUFACTURER_ID = 34818  # 0x8802
+        # H5080 advertises status under TWO manufacturer IDs — 34818 (0x8802) and
+        # 34883 (0x8843) — and the firmware rotates between them. Both encode the on/off
+        # state in the last byte: 0x00 = off, 0x01 = on (e.g. ec0001 01 00 / ec0002 01 01).
+        # Accept either so weak links that only catch one of them still update state.
+        GOvee_MANUFACTURER_IDS = (34818, 34883)  # 0x8802, 0x8843
 
         # Log all manufacturer data received
         if adv.manufacturer_data:
@@ -529,41 +514,42 @@ class GoveePlugH5080(GoveePlugH508x):
                     len(mfr_data)
                 )
 
-        if GOvee_MANUFACTURER_ID in adv.manufacturer_data:
-            mfr_data = adv.manufacturer_data[GOvee_MANUFACTURER_ID]
-            if len(mfr_data) >= 5:  # Ensure we have at least 5 bytes
-                old_state = self._is_on
-                self._device = device
-                # Last byte indicates state: 0x00 = off, 0x01 = on
-                self._is_on = mfr_data[-1] == 0x01
-                if old_state != self._is_on:
-                    _LOGGER.info(
-                        "H5080 %s: State changed from advertisement - is_on=%s (was=%s, mfr_data=%s)",
-                        device.address,
-                        self._is_on,
-                        old_state,
-                        mfr_data.hex()
-                    )
-                else:
-                    _LOGGER.debug(
-                        "H5080 %s: State updated from advertisement - is_on=%s (mfr_data=%s)",
-                        device.address,
-                        self._is_on,
-                        mfr_data.hex()
-                    )
-            else:
-                _LOGGER.debug(
-                    "H5080 %s: Manufacturer data too short - len=%d, expected>=5, data=%s",
+        mfr_data = next(
+            (adv.manufacturer_data[m] for m in GOvee_MANUFACTURER_IDS if m in adv.manufacturer_data),
+            None,
+        )
+        if mfr_data is not None and len(mfr_data) >= 5:
+            old_state = self._is_on
+            self._device = device
+            # Last byte indicates state: 0x00 = off, 0x01 = on
+            self._is_on = mfr_data[-1] == 0x01
+            if old_state != self._is_on:
+                _LOGGER.info(
+                    "H5080 %s: State changed from advertisement - is_on=%s (was=%s, mfr_data=%s)",
                     device.address,
-                    len(mfr_data),
+                    self._is_on,
+                    old_state,
                     mfr_data.hex()
                 )
+            else:
+                _LOGGER.debug(
+                    "H5080 %s: State updated from advertisement - is_on=%s (mfr_data=%s)",
+                    device.address,
+                    self._is_on,
+                    mfr_data.hex()
+                )
+        elif mfr_data is not None:
+            _LOGGER.debug(
+                "H5080 %s: Manufacturer data too short - len=%d, expected>=5, data=%s",
+                device.address,
+                len(mfr_data),
+                mfr_data.hex()
+            )
         else:
             _LOGGER.debug(
-                "H5080 %s: No matching manufacturer data (looking for %d/0x%04x), received: %s",
+                "H5080 %s: No matching manufacturer data (looking for %s), received: %s",
                 device.address,
-                GOvee_MANUFACTURER_ID,
-                GOvee_MANUFACTURER_ID,
+                GOvee_MANUFACTURER_IDS,
                 list(adv.manufacturer_data.keys()) if adv.manufacturer_data else "none"
             )
 
@@ -1039,6 +1025,8 @@ class GoveePlugPairer:
         self._send_uuid = send_uuid
         self._auth_msg = auth_msg
         self._result = asyncio.Future()
+        self._session: T.Optional[GoveeBleSession] = None
+        self._cipher = False
 
     async def begin(self):
         device_name = f"{self._device.name} ({self._device.address})"
@@ -1061,8 +1049,34 @@ class GoveePlugPairer:
             _LOGGER.error("failed to connect for pairing: %s: %s", device_name, e)
             raise
 
-        await self._client.start_notify(self._recv_uuid, self._recv_handler)
-        await self._send_get_auth_key()
+        # Post-OTA units require the encrypted session + a SHORT button press to hand out
+        # the token; older units answer the plaintext `aa b1` directly. Probe 0xE7 to decide.
+        self._session = GoveeBleSession(self._client, self._send_uuid, self._recv_uuid)
+        await self._session.start()
+        try:
+            await self._session.open_session(timeout=5.0)
+            self._cipher = True
+        except SessionError:
+            self._session.set_plaintext()  # legacy plug: identity framing, same subscription
+            self._cipher = False
+
+        _LOGGER.info(
+            "%s: connected for pairing; short-press the plug button to release its token",
+            device_name,
+        )
+        # Poll aa b1 either way (encrypted or plaintext). ~30s so the user has time to
+        # short-press the button, which opens the device's ~5s token window.
+        asyncio.create_task(self._fetch_token())
+
+    async def _fetch_token(self):
+        token = None
+        try:
+            token = await self._session.fetch_token(retries=75, delay=0.4)
+        except Exception as e:
+            # e.g. the (often weak) BLE link dropped mid-pairing -> services invalidated.
+            _LOGGER.error("%s: token fetch failed: %s", self._device.address, e)
+        if not self._result.done():
+            self._result.set_result(token.hex() if token else None)
 
     async def finish(self) -> str | None:
         token = await self._result
@@ -1077,24 +1091,6 @@ class GoveePlugPairer:
         except Exception as e:
             _LOGGER.debug("Error disconnecting %s: %s", device_name, e)
         return token
-
-    async def _send_get_auth_key(self):
-        _LOGGER.info(f"%s: asking for auth key", self._device.name)
-        await self._client.write_gatt_char(self._send_uuid, self._auth_msg)
-
-    async def _recv_handler(self, _, msg: bytearray):
-        if len(msg) != 20:
-            return
-
-        # Check for the response type and subtype
-        if msg[0] == 0xAA and msg[1] == 0xB1:
-            if msg[2] == 0x01:
-                auth_key = msg[3:-1]
-                _LOGGER.info(f"%s: received authentication key", self._device.name)
-                if not self._result.done():
-                    self._result.set_result(auth_key.hex())
-            else:
-                await self._send_get_auth_key()
 
 
 class NoOpPlugPairer:

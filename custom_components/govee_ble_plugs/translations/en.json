@@ -6,12 +6,12 @@
                 "title": "Set up Govee Smart Plug",
                 "data": {
                     "address": "Device address",
-                    "name": "[%key:common::config_flow::data::name%]"
+                    "name": "Name"
                 }
             },
             "link": {
                 "title": "Pair Govee Smart Plug",
-                "description": "Press the button on the outlet to register with Home Assistant."
+                "description": "Short-press the button on the plug once now, then click Submit. On newer firmware the plug only releases its pairing token for a few seconds after a short button press, so press it just before submitting (you have about 30 seconds)."
             },
             "init": {
                 "data": {
@@ -24,10 +24,10 @@
             "linking": "Failed to pair, please try again"
         },
         "abort": {
-            "already_configured_device": "[%key:common::config_flow::abort::already_configured_device%]",
-            "no_devices_found": "[%key:common::config_flow::abort::no_devices_found%]",
-            "unknown": "[%key:common::config_flow::error::unknown%]",
-            "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]"
+            "already_configured_device": "Device is already configured",
+            "no_devices_found": "No devices found on the network",
+            "unknown": "Unexpected error",
+            "cannot_connect": "Failed to connect"
         }
     },
     "entity": {

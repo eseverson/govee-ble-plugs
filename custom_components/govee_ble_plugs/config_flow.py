@@ -14,11 +14,12 @@ from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFl
 from homeassistant.const import CONF_ACCESS_TOKEN, CONF_ADDRESS, CONF_MODEL
 from homeassistant.core import callback
 
-from .const import DOMAIN, CONF_ENABLE_POLLING, DEFAULT_ENABLE_POLLING
+from .const import DOMAIN, CONF_ENABLE_POLLING
 from .plugs import (
     parse_advertisement_data,
     GoveeAdvertisementData,
     get_pair_by_model,
+    default_enable_polling,
     GoveePairApi,
 )
 
@@ -48,7 +49,9 @@ class GoveeBlePlugsConfigFlow(ConfigFlow, domain=DOMAIN):
             self._abort_if_unique_id_configured()
 
         old_entry_id: str | None = import_data.get("_old_entry_id")
-        options = import_data.get("options") or {CONF_ENABLE_POLLING: DEFAULT_ENABLE_POLLING}
+        options = import_data.get("options") or {
+            CONF_ENABLE_POLLING: default_enable_polling(import_data[CONF_MODEL])
+        }
 
         result = self.async_create_entry(
             title=import_data.get("title", "Govee Device"),
@@ -167,7 +170,7 @@ class GoveeBlePlugsConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_ACCESS_TOKEN: token,
                 CONF_MODEL: model,
             },
-            options={CONF_ENABLE_POLLING: DEFAULT_ENABLE_POLLING},
+            options={CONF_ENABLE_POLLING: default_enable_polling(model)},
         )
 
     @staticmethod

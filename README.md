@@ -50,10 +50,21 @@ Make sure Home Assistant can access Bluetooth on your host (or that you have a w
 
 Add the integration from **Settings → Devices & Services → Add Integration**, select your device model, and follow the prompts. Plugs appear as switch entities and the H6163 as a light entity.
 
+### Pairing (press the button)
+
+During pairing the plug only hands out its auth token after a **short press of the physical button**. When the config flow shows the "Pair Govee Smart Plug" screen, short-press the button on the plug once and then click **Submit**. The token is then stored and reused on every connection, so you only need to do this once per device.
+
+### Newer (post-OTA) H5080 firmware
+
+Govee pushed an OTA (around firmware `1.00.28`) that moved the H5080's local BLE control behind an **encrypted, per-connection session** (AES-128 + RC4) plus a token-based auth step. Plugs on that firmware stopped responding to the old plaintext commands (symptom: `authentication timeout` in the logs and switches that don't actuate).
+
+This integration speaks both protocols and **auto-detects** which one a plug uses on each connection, so updated and not-yet-updated units both work. The encrypted protocol was recovered by reverse-engineering the firmware. No cloud account or per-device secret is required — the session key and token are exchanged locally over BLE.
+
 ## Troubleshooting
 
 - **Range / connectivity** — make sure the device is within Bluetooth range of the host or a BLE proxy.
 - **Model** — confirm your model is in the supported list above.
+- **`authentication timeout` / switch won't actuate on an H5080** — the plug is likely on the newer encrypted firmware and needs to be **re-paired**: remove the device and add it again, short-pressing the button when prompted (see Pairing above). This refreshes the stored token to the one the updated firmware expects.
 - **Logs** — check **Settings → System → Logs** for messages from `govee_ble_plugs`. Enabling debug logging for the integration surfaces the raw advertisement and command bytes, which is the fastest way to diagnose state or protocol issues.
 
 ## Support & contributions
