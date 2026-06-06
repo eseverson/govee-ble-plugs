@@ -1,7 +1,10 @@
 """Frame cipher + session key schedule for post-OTA H5080 (fw 1.00.28+) plugs.
 
-A 2023-era OTA wrapped the plaintext BLE control protocol in an encrypted, per-connection
-session-key scheme. Recovered by reverse-engineering the RTL8720CF firmware; see
+A Govee OTA (fw 1.00.28, build Mar 17 2026) wrapped the existing plaintext BLE control
+protocol in an encrypted, per-connection session-key scheme. The inner protocol (20-byte
+command codec, XOR checksum, aa b1 token / 33 b2 auth) is unchanged from the pre-OTA
+firmware; only the E7 session exchange + AES/RC4 frame cipher are new. Recovered by
+reverse-engineering the RTL8720CF firmware; see
 docs/superpowers/notes/2026-06-05-h5080-ble-protocol.md for the full derivation.
 
 Frame format (20 bytes):
