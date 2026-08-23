@@ -176,18 +176,10 @@ class GoveePlugH508x:
                         max_attempts=2,  # Reduced to 2 to fail faster and free slots
                         connection_timeout=10.0,  # 10 second timeout per attempt
                     )
-                except BleakOutOfConnectionSlotsError as e:
-                    _LOGGER.error(
-                        "failed to set state: %s - No available connection slots. "
-                        "Please disconnect unused devices or add more BLE proxies.",
-                        device_name
-                    )
-                    # Mark all pending messages as failed
-                    while not must_process.empty():
-                        _, f = must_process.get_nowait()
-                        f.set_result(False)
-                    return
                 except Exception as e:
+                    # Always log `e`. In particular BleakOutOfConnectionSlotsError does
+                    # NOT reliably mean slot exhaustion — see the note in
+                    # GoveePlugPairer.begin — and its text carries the real reason.
                     _LOGGER.error("failed to connect to %s: %s", device_name, e)
                     # Mark all pending messages as failed
                     while not must_process.empty():
@@ -959,14 +951,17 @@ class GoveePlugPairer:
                 device_name,
                 max_attempts=3,
             )
-        except BleakOutOfConnectionSlotsError as e:
-            _LOGGER.error(
-                "failed to connect for pairing: %s - No available connection slots. "
-                "Please disconnect unused devices or add more BLE proxies.",
-                device_name
-            )
-            raise
         except Exception as e:
+            # Log `e` verbatim, never a canned substitute. BleakOutOfConnectionSlotsError
+            # in particular does NOT reliably mean slot exhaustion: bleak-retry-connector
+            # assigns that class by substring match over the error text
+            # ({"available connection", "connection slot", "ESP_GATT_CONN_CONN_CANCEL"}),
+            # and habluetooth's generic no-connectable-route error — "No backend with an
+            # available connection slot that can reach address ..." — matches the first
+            # two. Its text carries habluetooth's async_address_reachability_diagnostics()
+            # tail, which states the actual reason; a canned "out of slots, disconnect
+            # something" message threw that away and misdirected users whose adapters
+            # were idle.
             _LOGGER.error("failed to connect for pairing: %s: %s", device_name, e)
             raise
 
